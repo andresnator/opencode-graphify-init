@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-graphify-init",
+  "version": "0.1.0",
+  "description": "Consent-aware OpenCode plugin that refreshes Graphify graphs in the background.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/server.js",
+  "exports": {
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "commands/",
+    "docs/",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bash scripts/test-graphify-init.sh",
+    "verify:package": "node scripts/verify-package.mjs",
+    "check": "npm run typecheck && npm run build && npm test && npm run verify:package",
+    "prepublishOnly": "npm run check"
+  },
+  "engines": {
+    "opencode": ">=1.17.15 <2"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.13",
+    "@types/node": "24.13.3",
+    "esbuild": "0.28.1",
+    "opencode-ai": "1.18.13",
+    "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andresnator/opencode-graphify-init.git"
+  },
+  "bugs": {
+    "url": "https://github.com/andresnator/opencode-graphify-init/issues"
+  },
+  "homepage": "https://github.com/andresnator/opencode-graphify-init#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "graphify",
+    "code-graph",
+    "indexing"
+  ]
+}
