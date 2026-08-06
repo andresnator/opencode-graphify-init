@@ -4,31 +4,45 @@ Keep existing [Graphify](https://github.com/Graphify-Labs/graphify) graphs fresh
 
 ## Quick path
 
-Install Graphify first. Code-only indexing needs no model credentials:
+This is the temporary distribution route: the plugin is not available on npm, so choose a published `vX.Y.Z` tag from [GitHub Releases](https://github.com/andresnator/opencode-graphify-init/releases) and retain its local checkout.
 
-```bash
-uv tool install "graphifyy==0.9.32"
-```
+1. Install Graphify. Code-only indexing needs no model credentials:
 
-Clone and register the pinned plugin, then expose its companion command:
+   ```bash
+   uv tool install "graphifyy==0.9.32"
+   ```
 
-```bash
-git clone --branch v0.1.0 --depth 1 https://github.com/andresnator/opencode-graphify-init.git
-cd opencode-graphify-init
-opencode plugin "$PWD" --global
-mkdir -p "$HOME/.config/opencode/commands"
-ln -s "$PWD/commands/graphify-index.md" "$HOME/.config/opencode/commands/graphify-index.md"
-```
+2. Confirm that Git is installed and OpenCode is `>=1.17.15 <2`, then clone the release tag you selected:
 
-Keep the cloned directory because OpenCode and the command symlink refer to it. Restart OpenCode, open a concrete repository, and run:
+   ```bash
+   RELEASE_TAG=vX.Y.Z
+   git clone --branch "$RELEASE_TAG" --depth 1 https://github.com/andresnator/opencode-graphify-init.git
+   cd opencode-graphify-init
+   ```
 
-```text
-/graphify-index
-```
+3. For `v0.1.1` or later, register the checkout and expose its companion command:
+
+   ```bash
+   ./scripts/install.sh
+   ```
+
+4. Keep the cloned directory because OpenCode and the command link refer to it. Restart OpenCode, open a concrete repository, and run:
+
+   ```text
+   /graphify-index
+   ```
 
 The command asks for code-only or docs + code mode and records the choice. Future sessions refresh the graph automatically and incrementally.
 
 > The npm manifest is ready for `opencode-graphify-init@<version>`, but availability is not claimed until an npm release is published.
+
+### Installation safety and existing checkouts
+
+The installer asks OpenCode for its active global configuration directory before creating the command link, so plugin registration and command discovery use the same location. Re-running it is safe when the existing `/graphify-index` link points to the same checkout; it refuses to replace an unrelated file or link.
+
+To exercise an existing development checkout, run `./scripts/install.sh` at its repository root, keep it at that path, and restart OpenCode.
+
+The original `v0.1.0` tag predates the installer. For that tag only, register the checkout with `opencode plugin "$PWD" --global`, then link `commands/graphify-index.md` into `~/.config/opencode/commands/graphify-index.md` manually.
 
 ## Consent boundary
 
@@ -66,6 +80,7 @@ See [the lifecycle contract](docs/lifecycle.md) for the decision table and state
 |---|---|
 | `OPENCODE_GRAPHIFY_AUTOINIT=0` | Disable refresh for the current OpenCode process |
 | `OPENCODE_GRAPHIFY_GLOBAL=0` | Skip global-graph merge |
+| `OPENCODE_GRAPHIFY_DOCS=1` | Suggest docs + code in `/graphify-index`; the command still asks and the recorded mode still wins |
 | `OPENCODE_GRAPHIFY_BACKEND=<name>` | Backend fallback for legacy docs graphs without a recorded mode |
 | `GRAPHIFY_OUT=.ai/graphify-out` | Required in shells and MCP configuration so reads and writes agree |
 
@@ -106,11 +121,12 @@ The default export is `{ id, server }`, and the bundle imports only Node builtin
 ## Development
 
 ```bash
-npm ci
-npm run check
+pnpm install --frozen-lockfile
+pnpm run check
+pnpm run security:check
 ```
 
-The behavioral suite launches a real isolated OpenCode server and a fake Graphify binary. Its 42 scenarios cover consent, freshness, code/docs modes, corrupt graphs, empty corpora, nested repositories, global registration, locks, shutdown, timeouts, and notifications.
+The behavioral suite launches a real isolated OpenCode server and a fake Graphify binary. Its 42 lifecycle scenarios cover consent, freshness, code/docs modes, corrupt graphs, empty corpora, nested repositories, global registration, locks, shutdown, timeouts, and notifications. Nine additional installer scenarios cover fresh installation, idempotency, partial repair, config precedence, foreign-file ownership, rollback, path discovery, and help behavior.
 
 ## Repository map
 
@@ -118,7 +134,9 @@ The behavioral suite launches a real isolated OpenCode server and a fake Graphif
 |---|---|
 | `src/server.ts` | Background refresher implementation |
 | `commands/graphify-index.md` | Explicit first-index workflow |
+| `scripts/install.sh` | Safe global checkout and command registration |
 | `scripts/test-graphify-init.sh` | Real-server behavioral suite |
+| `scripts/test-install.sh` | Isolated installer ownership suite |
 | `docs/lifecycle.md` | Durable lifecycle and state contract |
 
 See [NOTICE.md](NOTICE.md) for extraction provenance. The project is licensed under the [MIT License](LICENSE).

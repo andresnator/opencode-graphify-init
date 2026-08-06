@@ -26,12 +26,12 @@ assert.equal(plugin.default?.id, "andresnator.graphify-init")
 assert.equal(typeof plugin.default?.server, "function")
 assert.equal("tui" in plugin.default, false, "server entry must not also export a TUI plugin")
 
-const packed = spawnSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], {
+const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
   cwd: root,
   encoding: "utf8",
 })
 assert.equal(packed.status, 0, packed.stderr || packed.stdout)
-const report = JSON.parse(packed.stdout)[0]
+const report = JSON.parse(packed.stdout)
 const files = new Set(report.files.map((entry) => entry.path))
 for (const required of [
   "dist/server.js",
@@ -43,7 +43,13 @@ for (const required of [
 ]) {
   assert.ok(files.has(required), `package is missing ${required}`)
 }
-for (const forbidden of ["src/server.ts", "scripts/test-graphify-init.sh", ".github/workflows/ci.yml"]) {
+for (const forbidden of [
+  "src/server.ts",
+  "scripts/install.sh",
+  "scripts/test-install.sh",
+  "scripts/test-graphify-init.sh",
+  ".github/workflows/ci.yml",
+]) {
   assert.ok(!files.has(forbidden), `package unexpectedly contains ${forbidden}`)
 }
 
