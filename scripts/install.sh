@@ -19,27 +19,6 @@ fail() {
   exit 1
 }
 
-json_string() {
-  local value=$1
-  value=${value//\\/\\\\}
-  value=${value//\"/\\\"}
-  printf '"%s"' "$value"
-}
-
-plugin_is_registered() {
-  local needle
-  local config_file
-  needle=$(json_string "$ROOT_DIR")
-  for config_file in "$CONFIG_DIR/opencode.json" "$CONFIG_DIR/opencode.jsonc"; do
-    [[ -f "$config_file" ]] || continue
-    if grep -Fq "$needle" "$config_file"; then
-      return 0
-    fi
-    return 1
-  done
-  return 1
-}
-
 if [[ $# -gt 1 ]]; then
   usage >&2
   exit 2
@@ -68,11 +47,6 @@ CONFIG_DIR=$(printf '%s\n' "$PATHS_OUTPUT" | awk '$1 == "config" { sub(/^[^[:spa
 COMMAND_DIR="$CONFIG_DIR/commands"
 COMMAND_TARGET="$COMMAND_DIR/$COMMAND_NAME"
 LINK_CREATED=0
-PLUGIN_REGISTERED=0
-
-if plugin_is_registered; then
-  PLUGIN_REGISTERED=1
-fi
 
 if [[ -e "$COMMAND_TARGET" || -L "$COMMAND_TARGET" ]]; then
   if [[ ! -e "$COMMAND_TARGET" || ! "$COMMAND_TARGET" -ef "$COMMAND_SOURCE" ]]; then
@@ -84,13 +58,11 @@ else
   LINK_CREATED=1
 fi
 
-if [[ $PLUGIN_REGISTERED -eq 0 ]]; then
-  if ! opencode plugin "$ROOT_DIR" --global; then
-    if [[ $LINK_CREATED -eq 1 && -L "$COMMAND_TARGET" && -e "$COMMAND_TARGET" && "$COMMAND_TARGET" -ef "$COMMAND_SOURCE" ]]; then
-      rm "$COMMAND_TARGET"
-    fi
-    fail "OpenCode could not register the plugin; no new command link was retained."
+if ! opencode plugin "$ROOT_DIR" --global; then
+  if [[ $LINK_CREATED -eq 1 && -L "$COMMAND_TARGET" && -e "$COMMAND_TARGET" && "$COMMAND_TARGET" -ef "$COMMAND_SOURCE" ]]; then
+    rm "$COMMAND_TARGET"
   fi
+  fail "OpenCode could not register the plugin; no new command link was retained."
 fi
 
 printf 'Installed OpenCode Graphify Init from %s\n' "$ROOT_DIR"

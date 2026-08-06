@@ -86,7 +86,8 @@ shouldRemainIdempotentWhenInstallerRunsAgain() {
 
   # Then
   [[ $(readlink "$target") == "$first_target" ]] || fail "rerun changed the managed command link"
-  [[ $(grep -c '^plugin$' "$FAKE_OPENCODE_LOG") -eq 1 ]] || fail "rerun repeated plugin registration"
+  [[ $(grep -c '^plugin$' "$FAKE_OPENCODE_LOG") -eq 2 ]] || fail "rerun did not verify plugin registration"
+  [[ $(grep -Fc "$ROOT_DIR" "$config_dir/opencode.json") -eq 1 ]] || fail "rerun duplicated the plugin config entry"
   assert_last_registration
 }
 
@@ -178,7 +179,8 @@ shouldRepairCommandLinkWhenPluginIsAlreadyRegistered() {
 
   # Then
   [[ -L "$target" && "$target" -ef "$COMMAND_SOURCE" ]] || fail "installer did not repair a missing command link"
-  [[ ! -s "$FAKE_OPENCODE_LOG" ]] || fail "installer repeated an existing plugin registration"
+  [[ $(grep -c '^plugin$' "$FAKE_OPENCODE_LOG") -eq 1 ]] || fail "installer did not verify existing registration through OpenCode"
+  assert_last_registration
 }
 
 shouldCompleteRegistrationWhenManagedLinkExistsWithoutConfig() {
@@ -198,13 +200,15 @@ shouldCompleteRegistrationWhenManagedLinkExistsWithoutConfig() {
   assert_last_registration
 }
 
-shouldIgnoreInactiveJsoncWhenJsonConfigExists() {
+shouldRegisterPluginWhenCheckoutPathOnlyAppearsOutsidePluginArray() {
   # Given
-  local config_dir="$SUITE_DIR/config-precedence"
+  local config_dir="$SUITE_DIR/unrelated-path"
   local target="$config_dir/commands/graphify-index.md"
   mkdir -p "$config_dir"
-  printf '{"plugin":[]}\n' >"$config_dir/opencode.json"
-  printf '{"plugin":["%s"]}\n' "$ROOT_DIR" >"$config_dir/opencode.jsonc"
+  printf '{\n  // Previous checkout: "%s"\n  "username": "%s",\n  "plugin": []\n}\n' \
+    "$ROOT_DIR" \
+    "$ROOT_DIR" \
+    >"$config_dir/opencode.jsonc"
   : >"$FAKE_OPENCODE_LOG"
 
   # When
@@ -212,7 +216,7 @@ shouldIgnoreInactiveJsoncWhenJsonConfigExists() {
 
   # Then
   [[ -L "$target" && "$target" -ef "$COMMAND_SOURCE" ]] || fail "installer did not create the command link"
-  [[ $(grep -c '^plugin$' "$FAKE_OPENCODE_LOG") -eq 1 ]] || fail "installer treated the inactive JSONC file as authoritative"
+  [[ $(grep -c '^plugin$' "$FAKE_OPENCODE_LOG") -eq 1 ]] || fail "installer treated a comment or unrelated field as plugin registration"
   assert_last_registration
 }
 
@@ -224,6 +228,6 @@ shouldPrintUsageWithoutMutationWhenHelpIsRequested
 shouldRefuseInstallWhenOpenCodeDoesNotReportConfig
 shouldRepairCommandLinkWhenPluginIsAlreadyRegistered
 shouldCompleteRegistrationWhenManagedLinkExistsWithoutConfig
-shouldIgnoreInactiveJsoncWhenJsonConfigExists
+shouldRegisterPluginWhenCheckoutPathOnlyAppearsOutsidePluginArray
 
 printf 'PASS: 9 installer contracts.\n'
