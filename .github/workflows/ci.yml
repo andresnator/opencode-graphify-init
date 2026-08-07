@@ -7,15 +7,53 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run check
+          node-version-file: .node-version
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.34.5
+          run_install: false
+      - name: Validate pull request title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/validate-pr-title.mjs
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run complete repository check
+        run: pnpm run check
+      - name: Review dependency changes
+        if: matrix.platform == 'ubuntu' && github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          fail-on-scopes: runtime,development,unknown
+          license-check: false
+      - name: Audit dependency vulnerabilities
+        if: matrix.platform == 'ubuntu'
+        run: pnpm run security:audit
+      - name: Verify dependency registry signatures
+        if: matrix.platform == 'ubuntu'
+        run: pnpm run security:signatures
+      - name: Verify committed distribution
+        run: git diff --exit-code -- dist

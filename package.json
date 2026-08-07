@@ -2,6 +2,7 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-graphify-init",
   "version": "0.1.0",
+  "packageManager": "pnpm@10.34.5",
   "description": "Consent-aware OpenCode plugin that refreshes Graphify graphs in the background.",
   "license": "MIT",
   "type": "module",
@@ -23,12 +24,17 @@
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "bash scripts/test-graphify-init.sh",
+    "test": "bash scripts/test-install.sh && bash scripts/test-graphify-init.sh && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs",
     "verify:package": "node scripts/verify-package.mjs",
-    "check": "npm run typecheck && npm run build && npm test && npm run verify:package",
-    "prepublishOnly": "npm run check"
+    "verify:workflows": "node scripts/verify-workflow-actions.mjs",
+    "security:audit": "pnpm audit --audit-level=low",
+    "security:signatures": "node scripts/verify-registry-signatures.mjs",
+    "security:check": "pnpm run security:audit && pnpm run security:signatures",
+    "check": "pnpm run typecheck && pnpm run verify:workflows && pnpm run build && pnpm run test && pnpm run verify:package",
+    "prepublishOnly": "pnpm run check && pnpm run security:check"
   },
   "engines": {
+    "node": "22.23.2",
     "opencode": ">=1.17.15 <2"
   },
   "devDependencies": {

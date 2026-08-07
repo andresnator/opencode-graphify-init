@@ -2,7 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ -z "${OPENCODE_BIN:-}" && -x "$ROOT_DIR/node_modules/.bin/opencode" ]]; then
+LOCAL_OPENCODE_BIN="$ROOT_DIR/node_modules/opencode-ai/bin/opencode.exe"
+if [[ -z "${OPENCODE_BIN:-}" && -x "$LOCAL_OPENCODE_BIN" ]]; then
+  # pnpm generates a non-exec shell shim in node_modules/.bin. Launch the package's
+  # native binary directly so SERVER_PID remains the process that owns all extract children.
+  OPENCODE_BIN="$LOCAL_OPENCODE_BIN"
+elif [[ -z "${OPENCODE_BIN:-}" && -x "$ROOT_DIR/node_modules/.bin/opencode" ]]; then
   OPENCODE_BIN="$ROOT_DIR/node_modules/.bin/opencode"
 else
   OPENCODE_BIN=${OPENCODE_BIN:-$(command -v opencode || true)}
