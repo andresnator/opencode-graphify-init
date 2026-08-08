@@ -6,11 +6,13 @@ Keep existing [Graphify](https://github.com/Graphify-Labs/graphify) graphs fresh
 
 This is the temporary distribution route: the plugin is not available on npm, so choose a published `vX.Y.Z` tag from [GitHub Releases](https://github.com/andresnator/opencode-graphify-init/releases) and retain its local checkout.
 
-1. Install Graphify. Code-only indexing needs no model credentials:
+1. Install Graphify with its MCP server support. Code-only indexing needs no model credentials:
 
    ```bash
-   uv tool install "graphifyy==0.9.32"
+   uv tool install "graphifyy[mcp]==0.9.32"
    ```
+
+   The `mcp` extra installs the dependencies required by `graphify-mcp`. The background refresh plugin itself only invokes the `graphify` CLI, but OpenCode's `graphify` and `graphify-global` MCP servers cannot start without this extra.
 
 2. Confirm that Git is installed and OpenCode is `>=1.17.15 <2`, then clone the release tag you selected:
 
