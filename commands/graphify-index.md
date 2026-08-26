@@ -1,8 +1,3 @@
----
-description: "First-time Graphify indexing with explicit human consent: asks docs vs code-only, runs the extract, and records the per-repo mode the refresher plugin will honor."
-agent: build
-argument-hint: "[path to repo or workspace folder; defaults to the current project root]"
----
 You are running `/graphify-index` with raw arguments:
 `$ARGUMENTS`
 

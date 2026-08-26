@@ -24,6 +24,9 @@ var MODE_DOCS = "docs";
 var SEMANTIC_MARKER_FILE = ".graphify_semantic_marker";
 var LOCK_FILE = ".opencode-extract-lock";
 var INDEX_COMMAND = "/graphify-index";
+var INDEX_COMMAND_NAME = "graphify-index";
+var INDEX_COMMAND_DESCRIPTION = "First-time Graphify indexing with explicit human consent: choose code-only or docs mode and record that decision for automatic refreshes.";
+var INDEX_COMMAND_FILE = new URL("../commands/graphify-index.md", import.meta.url);
 var EMPTY_MARKER_NO_COMMIT = "none";
 var EMPTY_CORPUS_PATTERN = /produced no nodes/i;
 var GLOBAL_MERGE_WARNING_PATTERN = /\[graphify global\] warning/i;
@@ -102,6 +105,23 @@ function formatElapsed(elapsedMs) {
 }
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+var indexCommandTemplate;
+function loadIndexCommandTemplate() {
+  indexCommandTemplate ??= fs.readFile(INDEX_COMMAND_FILE, "utf8").then((template) => template.trim());
+  return indexCommandTemplate;
+}
+async function registerGraphifyIndexCommand(config) {
+  config.command ??= {};
+  if (config.command[INDEX_COMMAND_NAME]) {
+    console.warn(`${LOG_PREFIX} ${INDEX_COMMAND} already exists; keeping the existing command`);
+    return;
+  }
+  config.command[INDEX_COMMAND_NAME] = {
+    template: await loadIndexCommandTemplate(),
+    description: INDEX_COMMAND_DESCRIPTION,
+    agent: "build"
+  };
 }
 function appendBoundedOutput(current, chunk) {
   return `${current}${String(chunk)}`.slice(-MAX_CAPTURED_OUTPUT_LENGTH);
@@ -689,6 +709,7 @@ var GraphifyInitPlugin = async (input) => {
     console.error(`${LOG_PREFIX} ${errorMessage(error)}`);
   });
   return {
+    config: registerGraphifyIndexCommand,
     // A client-driven bus event means a subscribed client is interacting, so queued
     // toasts can land; boot-time housekeeping events must not trip the latch.
     event: async ({ event }) => {
@@ -703,5 +724,6 @@ var server_default = {
 export {
   GRAPHIFY_INIT_PLUGIN_ID,
   GraphifyInitPlugin,
-  server_default as default
+  server_default as default,
+  registerGraphifyIndexCommand
 };

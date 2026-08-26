@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import fs from "node:fs/promises"
 import path from "node:path"
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Config, Plugin } from "@opencode-ai/plugin"
 
 export const GRAPHIFY_INIT_PLUGIN_ID = "andresnator.graphify-init"
 const LOG_PREFIX = "[graphify-init]"
@@ -42,6 +42,10 @@ const SEMANTIC_MARKER_FILE = ".graphify_semantic_marker"
 // is dead — then it belonged to a fully crashed session and is silently replaced.
 const LOCK_FILE = ".opencode-extract-lock"
 const INDEX_COMMAND = "/graphify-index"
+const INDEX_COMMAND_NAME = "graphify-index"
+const INDEX_COMMAND_DESCRIPTION =
+  "First-time Graphify indexing with explicit human consent: choose code-only or docs mode and record that decision for automatic refreshes."
+const INDEX_COMMAND_FILE = new URL("../commands/graphify-index.md", import.meta.url)
 // Marker value for roots where `git rev-parse HEAD` resolves nothing (plain directories,
 // repositories with no commits): the marker must still be written there, or the plugin
 // would re-extract and re-toast the same empty corpus every session.
@@ -227,6 +231,27 @@ function formatElapsed(elapsedMs: number) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+let indexCommandTemplate: Promise<string> | undefined
+
+function loadIndexCommandTemplate() {
+  indexCommandTemplate ??= fs.readFile(INDEX_COMMAND_FILE, "utf8").then((template) => template.trim())
+  return indexCommandTemplate
+}
+
+export async function registerGraphifyIndexCommand(config: Config) {
+  config.command ??= {}
+  if (config.command[INDEX_COMMAND_NAME]) {
+    console.warn(`${LOG_PREFIX} ${INDEX_COMMAND} already exists; keeping the existing command`)
+    return
+  }
+
+  config.command[INDEX_COMMAND_NAME] = {
+    template: await loadIndexCommandTemplate(),
+    description: INDEX_COMMAND_DESCRIPTION,
+    agent: "build",
+  }
 }
 
 // Keep the TAIL of each stream: Graphify's decisive lines — the empty-corpus signal and
@@ -1019,6 +1044,7 @@ export const GraphifyInitPlugin: Plugin = async (input) => {
     console.error(`${LOG_PREFIX} ${errorMessage(error)}`)
   })
   return {
+    config: registerGraphifyIndexCommand,
     // A client-driven bus event means a subscribed client is interacting, so queued
     // toasts can land; boot-time housekeeping events must not trip the latch.
     event: async ({ event }) => {
