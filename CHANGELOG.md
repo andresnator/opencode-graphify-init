@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.2...v0.1.3) (2026-08-27)
+
+
+### Features
+
+* add npm version badge ([#12](https://github.com/andresnator/opencode-graphify-init/issues/12)) ([af75258](https://github.com/andresnator/opencode-graphify-init/commit/af75258666f304219f8bf6c240e4263d9b5c92a9))
+
 ## [0.1.2](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.1...v0.1.2) (2026-08-27)
 
 
