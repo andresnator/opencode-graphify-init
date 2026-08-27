@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.4...v0.1.5) (2026-08-27)
+
+
+### Bug Fixes
+
+* **config:** silence duplicate graphify-index registration ([#19](https://github.com/andresnator/opencode-graphify-init/issues/19)) ([d6c4100](https://github.com/andresnator/opencode-graphify-init/commit/d6c410093dacb75914f9b190c8e5290e5a42797a))
+
 ## [0.1.4](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.3...v0.1.4) (2026-08-27)
 
 
