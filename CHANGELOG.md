@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.3...v0.1.4) (2026-08-27)
+
+
+### Bug Fixes
+
+* **install:** support first clean-cache installation ([#16](https://github.com/andresnator/opencode-graphify-init/issues/16)) ([3dac49d](https://github.com/andresnator/opencode-graphify-init/commit/3dac49d4cee55e540129e6a1c4e7ce26b322b3fe))
+
 ## [0.1.3](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.2...v0.1.3) (2026-08-27)
 
 
