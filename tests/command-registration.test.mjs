@@ -15,7 +15,7 @@ async function shouldRegisterTheBundledCommandWhenNoCommandExists() {
   assert.match(config.command["graphify-index"].template, /Never run `graphify update`/)
 }
 
-async function shouldPreserveAnExistingCommandWhenTheNameIsAlreadyOwned() {
+async function shouldSilentlyPreserveAnExistingCommandWhenTheNameIsAlreadyOwned() {
   // Given
   const existing = { template: "Keep me", description: "User command" }
   const config = { command: { "graphify-index": existing } }
@@ -32,9 +32,9 @@ async function shouldPreserveAnExistingCommandWhenTheNameIsAlreadyOwned() {
 
   // Then
   assert.equal(config.command["graphify-index"], existing)
-  assert.deepEqual(warnings, ["[graphify-init] /graphify-index already exists; keeping the existing command"])
+  assert.deepEqual(warnings, [])
 }
 
 await shouldRegisterTheBundledCommandWhenNoCommandExists()
-await shouldPreserveAnExistingCommandWhenTheNameIsAlreadyOwned()
+await shouldSilentlyPreserveAnExistingCommandWhenTheNameIsAlreadyOwned()
 process.stdout.write("PASS: 2 bundled command registration contracts.\n")
