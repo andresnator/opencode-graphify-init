@@ -7,89 +7,60 @@ body:
   - type: markdown
     attributes:
       value: |
-        Use this form only for public, non-security bugs.
-        **Do not post secrets or suspected vulnerability details.** Report vulnerabilities only through [GitHub Private Vulnerability Reporting](https://github.com/andresnator/opencode-graphify-init/security/advisories/new).
-
+        Do not post secrets or vulnerability details. Use [private vulnerability reporting](https://github.com/andresnator/opencode-graphify-init/security/advisories/new) for security issues.
   - type: input
     id: plugin-version
     attributes:
-      label: Plugin version or revision
-      description: Provide the source tag or commit SHA loaded by OpenCode.
-      placeholder: vX.Y.Z or a full commit SHA
+      label: Plugin version
+      placeholder: 0.1.1
     validations:
       required: true
-
   - type: input
     id: opencode-version
     attributes:
       label: OpenCode version
-      description: Provide the exact OpenCode version.
       placeholder: 1.18.13
     validations:
       required: true
-
   - type: input
     id: graphify-version
     attributes:
       label: Graphify version
-      description: Provide the exact `graphify --version` output.
       placeholder: 0.9.32
     validations:
       required: true
-
   - type: dropdown
     id: recorded-mode
     attributes:
-      label: Recorded indexing mode
-      description: Select the mode stored for the affected repository.
-      options:
-        - code-only
-        - docs
-        - no mode file yet
-        - unknown
+      label: Recorded mode
+      options: [code-only, docs, no mode file, unknown]
     validations:
       required: true
-
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: Include the operating system and version, CPU architecture, shell, Node.js version, and whether the root is one repository or an aggregator workspace.
+      description: Operating system, architecture, shell, Node.js, and repository shape.
     validations:
       required: true
-
   - type: textarea
     id: reproduction
     attributes:
-      label: Reproduction steps
-      description: Provide the smallest sequence that consistently shows the problem.
-      placeholder: |
-        1. Start with ...
-        2. Run ...
-        3. Observe ...
+      label: Reproduction
+      description: Smallest repeatable sequence.
     validations:
       required: true
-
   - type: textarea
-    id: expected-result
+    id: result
     attributes:
-      label: Expected result
-      description: Describe what you expected to observe.
+      label: Expected and actual result
+      description: Include the exact visible error when relevant.
     validations:
       required: true
-
-  - type: textarea
-    id: actual-result
-    attributes:
-      label: Actual result
-      description: Describe what happened instead, including the exact visible error when relevant.
-    validations:
-      required: true
-
   - type: textarea
     id: sanitized-logs
     attributes:
-      label: Sanitized logs or output
-      description: Paste only the smallest relevant excerpt after removing tokens, credentials, user names, private paths, repository content, and backend secrets. Write `None` when no logs are available.
+      label: Sanitized logs
+      description: Remove credentials, names, private paths, repository data, and backend secrets. Write `None` when unavailable.
     validations:
       required: true

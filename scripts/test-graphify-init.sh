@@ -656,6 +656,25 @@ chmod +x "$FAKE_BIN_DIR/graphify"
 mkdir -p "$TARGET_DIR"
 jq -n --arg plugin "file://$ROOT_DIR/src/server.ts" '{plugin: [$plugin]}' > "$TARGET_DIR/opencode.json"
 
+shouldExposeBundledIndexCommandThroughOpenCodeConfig() {
+  # Given an isolated OpenCode server loading the source plugin.
+  local root
+  local response="$SUITE_DIR/bundled-command.config.json"
+  root=$(make_committed_repo bundled-command-repo)
+  start_server bundled-command 0 "$FAKE_BIN_DIR:/usr/bin:/bin"
+
+  # When
+  request_config "$root" "$response"
+
+  # Then the host invoked the plugin config hook and exposed the packaged command contract.
+  jq -e '
+    .command["graphify-index"].agent == "build" and
+    (.command["graphify-index"].description | test("explicit human consent"; "i")) and
+    (.command["graphify-index"].template | contains("Never run `graphify update`"))
+  ' "$response" >/dev/null || fail "OpenCode config did not expose the bundled /graphify-index command"
+  cleanup_processes
+}
+
 shouldKeepConfigResponsiveWhileBuildingInBackground() {
   # Given standing consent (mode file) with no graph yet: exactly what a deleted or
   # never-completed first pass leaves behind — the plugin rebuilds automatically.
@@ -1694,6 +1713,7 @@ shouldWarnWhenBinaryIsMissing() {
   cleanup_processes
 }
 
+shouldExposeBundledIndexCommandThroughOpenCodeConfig
 shouldKeepConfigResponsiveWhileBuildingInBackground
 shouldStaySilentWhenGraphMatchesHeadCommit
 shouldHintOncePerSessionInsteadOfFirstIndexing

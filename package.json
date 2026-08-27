@@ -24,14 +24,13 @@
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "bash scripts/test-install.sh && bash scripts/test-graphify-init.sh && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs",
+    "test": "bash scripts/test-graphify-init.sh && node tests/command-registration.test.mjs && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs && node tests/package-publication.test.mjs && node tests/publish-workflow.test.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:workflows": "node scripts/verify-workflow-actions.mjs",
     "security:audit": "pnpm audit --audit-level=low",
     "security:signatures": "node scripts/verify-registry-signatures.mjs",
     "security:check": "pnpm run security:audit && pnpm run security:signatures",
-    "check": "pnpm run typecheck && pnpm run verify:workflows && pnpm run build && pnpm run test && pnpm run verify:package",
-    "prepublishOnly": "pnpm run check && pnpm run security:check"
+    "check": "pnpm run typecheck && pnpm run verify:workflows && pnpm run build && pnpm run test && pnpm run verify:package"
   },
   "engines": {
     "node": "22.23.2",
@@ -45,7 +44,8 @@
     "typescript": "5.9.3"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "repository": {
     "type": "git",

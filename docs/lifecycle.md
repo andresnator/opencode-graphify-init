@@ -1,36 +1,49 @@
-# Graph lifecycle contract
+# Understand the Graphify lifecycle
 
-The lifecycle deliberately separates a human decision from automatic maintenance.
-
-1. `/graphify-index` asks whether to index and whether to use code-only or docs mode.
-2. Before extraction it writes `.ai/graphify-out/.opencode-index-mode` while holding `.opencode-extract-lock`.
-3. On later OpenCode sessions the plugin reads that recorded mode. It refreshes stale or damaged graphs but never overrides the decision from environment variables.
-4. A project with neither a readable graph nor a mode file receives one hint and no Graphify process.
+First indexing is a human decision. Later sessions maintain only graphs whose mode has already been recorded.
 
 ## State
 
-| Path | Meaning |
-|---|---|
-| `.ai/graphify-out/graph.json` | Current local graph |
-| `.ai/graphify-out/.opencode-index-mode` | Standing consent and `code-only` or `docs` mode |
-| `.ai/graphify-out/.opencode-extract-lock` | Live OpenCode/extract process IDs |
-| `.ai/graphify-out/.opencode-empty-corpus` | Commit known to contain no indexable nodes |
-| `~/.graphify/global-graph.json` | Optional cross-repository graph |
+| Path | Purpose |
+| --- | --- |
+| `.ai/graphify-out/graph.json` | Current graph |
+| `.ai/graphify-out/.opencode-index-mode` | Standing consent and selected mode |
+| `.ai/graphify-out/.opencode-extract-lock` | Live OpenCode and Graphify process IDs |
+| `.ai/graphify-out/.opencode-empty-corpus` | Commit known to have no indexable nodes |
+| `~/.graphify/global-graph.json` | Optional cross-project graph |
 
-Every Graphify invocation receives `GRAPHIFY_OUT=.ai/graphify-out`. Do not combine that variable with `--out`: Graphify concatenates them and the writer no longer agrees with the MCP lookup path.
+Every Graphify call receives `GRAPHIFY_OUT=.ai/graphify-out`. Using `--out` as well creates a different path and breaks MCP lookup.
 
 ## Refresh decisions
 
-- A graph whose `built_at_commit` equals `HEAD` is left untouched.
-- A different commit triggers an incremental `graphify extract` in the recorded mode.
-- An unreadable or deleted graph is rebuilt only when a mode file records prior consent.
-- Legacy graphs without a mode file infer docs mode from `.graphify_semantic_marker`, then persist an explicit mode after a successful refresh.
-- An empty corpus is informational and recorded at the current commit, preventing a retry loop until the repository changes.
+- Matching `built_at_commit` and Git `HEAD`: no work.
+- Different commit: incremental extract in the recorded mode.
+- Missing or unreadable graph with a mode file: rebuild.
+- No graph and no mode file: show one hint and wait for `/graphify-index`.
+- Empty corpus: record the commit and retry only after the repository changes.
+
+Legacy graphs infer docs mode from `.graphify_semantic_marker`, then store an explicit mode after a successful refresh.
+
+## Change mode
+
+Code-only to docs needs no purge; the semantic pass adds document nodes. Docs to code-only requires removing the repository from the global graph and clearing `.ai/graphify-out/` before running `/graphify-index` again. Incremental code-only extraction does not remove old document nodes.
 
 ## Process safety
 
-The lock contains the OpenCode PID and, once spawned, the Graphify child PID. A second session skips a repository while either PID is alive. Stale locks are repaired only after every recorded process is gone.
+The lock records the OpenCode process and active Graphify child. Another session skips live locks. Stale locks are repaired only after every recorded process exits.
 
-Extract children receive a 30-minute default budget, terminate with OpenCode on normal shutdown, and escalate from `SIGTERM` to `SIGKILL` when necessary. Closing a session therefore cannot normally leave a docs-mode process spending tokens in the background.
+Extracts have a 30-minute budget. OpenCode shutdown sends `SIGTERM`, then `SIGKILL` when needed, preventing abandoned docs-mode work from spending tokens indefinitely.
 
-See the root README for environment variables, installation, and recovery commands.
+## Recover
+
+The error toast prints a mode-faithful command. Code-only uses:
+
+```bash
+GRAPHIFY_OUT=.ai/graphify-out graphify extract '<repo>' --code-only
+```
+
+For docs mode, use `--backend <backend>`. If only global registration failed:
+
+```bash
+graphify global add '<repo>/.ai/graphify-out/graph.json' --as <repo-tag>
+```
