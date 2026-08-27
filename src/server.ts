@@ -202,9 +202,9 @@ const aggregateFailureMessage = (okCount: number, total: number, rootName: strin
 }
 
 function projectRoot(input: { worktree?: string; directory: string }) {
-  const worktree = input.worktree ?? ""
-  if (!worktree || worktree === path.parse(worktree).root) return input.directory
-  return worktree
+  const reportedWorktree = input.worktree ?? ""
+  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory
+  return reportedWorktree
 }
 
 function repoName(root: string) {
