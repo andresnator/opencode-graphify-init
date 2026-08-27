@@ -84,9 +84,9 @@ var aggregateFailureMessage = (okCount, total, rootName, failedNames) => {
   return `Graphify built ${okCount} of ${total} code graphs under ${rootName}. Failed: ${list}. Reopen the session to retry, or run ${INDEX_COMMAND}.`;
 };
 function projectRoot(input) {
-  const worktree = input.worktree ?? "";
-  if (!worktree || worktree === path.parse(worktree).root) return input.directory;
-  return worktree;
+  const reportedWorktree = input.worktree ?? "";
+  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory;
+  return reportedWorktree;
 }
 function repoName(root) {
   return path.basename(root) || root;
