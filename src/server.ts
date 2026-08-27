@@ -243,7 +243,6 @@ function loadIndexCommandTemplate() {
 export async function registerGraphifyIndexCommand(config: Config) {
   config.command ??= {}
   if (config.command[INDEX_COMMAND_NAME]) {
-    console.warn(`${LOG_PREFIX} ${INDEX_COMMAND} already exists; keeping the existing command`)
     return
   }
 
