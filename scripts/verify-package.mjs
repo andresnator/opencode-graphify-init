@@ -1,7 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
-import { pathToFileURL } from "node:url"
 
 const root = new URL("../", import.meta.url)
 const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8"))
@@ -10,7 +9,9 @@ const bundle = await readFile(bundleUrl, "utf8")
 
 assert.equal(packageJson.name, "opencode-graphify-init")
 assert.equal(packageJson.dependencies, undefined, "published package must not have runtime dependencies")
+assert.equal(packageJson.exports?.["."]?.import, "./dist/server.js")
 assert.equal(packageJson.exports?.["./server"]?.import, "./dist/server.js")
+assert.equal(packageJson.engines?.node, ">=22.0.0")
 assert.equal(packageJson.engines?.opencode, ">=1.17.15 <2")
 assert.ok(!bundle.includes("agents-orchestrator"), "bundle still contains source-harness coupling")
 
@@ -21,10 +22,12 @@ assert.deepEqual(
   "bundle contains a non-Node runtime import",
 )
 
-const plugin = await import(pathToFileURL(bundleUrl.pathname).href)
-assert.equal(plugin.default?.id, "andresnator.graphify-init")
-assert.equal(typeof plugin.default?.server, "function")
-assert.equal("tui" in plugin.default, false, "server entry must not also export a TUI plugin")
+const rootPlugin = await import(packageJson.name)
+const serverPlugin = await import(`${packageJson.name}/server`)
+assert.equal(rootPlugin.default, serverPlugin.default, "root and /server must resolve to the same plugin")
+assert.equal(rootPlugin.default?.id, "andresnator.graphify-init")
+assert.equal(typeof rootPlugin.default?.server, "function")
+assert.equal("tui" in rootPlugin.default, false, "server entry must not also export a TUI plugin")
 
 const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
   cwd: root,

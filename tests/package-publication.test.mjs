@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises"
 const ROOT = new URL("../", import.meta.url)
 const PACKAGE_NAME = "opencode-graphify-init"
 const NPM_REGISTRY = "https://registry.npmjs.org/"
+const NODE_RANGE = ">=22.0.0"
 const OPENCODE_RANGE = ">=1.17.15 <2"
 const NPM_LIFECYCLE_SCRIPTS = [
   "dependencies",
@@ -37,7 +38,7 @@ const EXPECTED_PACKAGE_FILES = [
 
 const packageJson = JSON.parse(await readFile(new URL("package.json", ROOT), "utf8"))
 
-function shouldExposeOnlyTheServerPluginWhenPackageIsPublished() {
+function shouldExposeBothServerEntrypointsWhenPackageIsPublished() {
   // Given
   const lifecycleScripts = NPM_LIFECYCLE_SCRIPTS.filter((script) => packageJson.scripts?.[script] !== undefined)
 
@@ -48,6 +49,7 @@ function shouldExposeOnlyTheServerPluginWhenPackageIsPublished() {
     private: packageJson.private,
     publishConfig: packageJson.publishConfig,
     exports: packageJson.exports,
+    nodeEngine: packageJson.engines?.node,
     opencodeEngine: packageJson.engines?.opencode,
     dependencies: packageJson.dependencies,
     optionalDependencies: packageJson.optionalDependencies,
@@ -64,11 +66,16 @@ function shouldExposeOnlyTheServerPluginWhenPackageIsPublished() {
     private: undefined,
     publishConfig: { access: "public", registry: NPM_REGISTRY },
     exports: {
+      ".": {
+        types: "./dist/server.d.ts",
+        import: "./dist/server.js",
+      },
       "./server": {
         types: "./dist/server.d.ts",
         import: "./dist/server.js",
       },
     },
+    nodeEngine: NODE_RANGE,
     opencodeEngine: OPENCODE_RANGE,
     dependencies: undefined,
     optionalDependencies: undefined,
@@ -106,6 +113,6 @@ function shouldContainOnlyTheExpectedFilesWhenPackageIsPacked() {
   assert.deepEqual(actual, expected)
 }
 
-shouldExposeOnlyTheServerPluginWhenPackageIsPublished()
+shouldExposeBothServerEntrypointsWhenPackageIsPublished()
 shouldContainOnlyTheExpectedFilesWhenPackageIsPacked()
 process.stdout.write("PASS: 2 npm publication contracts.\n")

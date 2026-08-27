@@ -8,6 +8,10 @@
   "type": "module",
   "main": "./dist/server.js",
   "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
     "./server": {
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js"
@@ -24,7 +28,8 @@
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "bash scripts/test-graphify-init.sh && node tests/command-registration.test.mjs && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs && node tests/package-publication.test.mjs && node tests/publish-workflow.test.mjs",
+    "test": "bash scripts/test-graphify-init.sh && node tests/command-registration.test.mjs && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs && node tests/package-publication.test.mjs && node tests/ci-workflow.test.mjs && node tests/publish-workflow.test.mjs && pnpm run test:install",
+    "test:install": "node tests/clean-cache-install.test.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:workflows": "node scripts/verify-workflow-actions.mjs",
     "security:audit": "pnpm audit --audit-level=low",
@@ -33,7 +38,7 @@
     "check": "pnpm run typecheck && pnpm run verify:workflows && pnpm run build && pnpm run test && pnpm run verify:package"
   },
   "engines": {
-    "node": "22.23.2",
+    "node": ">=22.0.0",
     "opencode": ">=1.17.15 <2"
   },
   "devDependencies": {
