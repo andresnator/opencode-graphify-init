@@ -10,6 +10,8 @@ pnpm run check
 pnpm run security:check
 ```
 
+CI also verifies a first npm installation with an empty cache on OpenCode 1.18.0, 1.18.20, and the latest 1.x release.
+
 Keep one behavior per change. Update its tests and public documentation before opening a pull request. Do not rewrite `pnpm-lock.yaml` with npm, Yarn, or another pnpm version.
 
 ## Test local source
