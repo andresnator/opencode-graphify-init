@@ -348,7 +348,7 @@ start_server() {
 request_config() {
   local root=$1
   local output=$2
-  curl -fsS --max-time 5 --get --data-urlencode "directory=$root" \
+  curl -fsS --max-time "$TEST_TIMEOUT_SECONDS" --get --data-urlencode "directory=$root" \
     "http://127.0.0.1:$PORT/config" >"$output"
   jq -e . "$output" >/dev/null
 }
