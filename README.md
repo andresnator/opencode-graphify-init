@@ -1,5 +1,7 @@
 # OpenCode Graphify Init
 
+[![npm version](https://img.shields.io/npm/v/opencode-graphify-init.svg)](https://www.npmjs.com/package/opencode-graphify-init)
+
 Keep existing [Graphify](https://github.com/Graphify-Labs/graphify) graphs fresh in the background. First indexing always requires an explicit `/graphify-index` decision; automatic sessions never start a token-spending first pass.
 
 ## Install
