@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.5...v0.1.6) (2026-08-31)
+
+
+### Dependencies
+
+* bump @types/node from 24.13.3 to 26.2.0 ([#7](https://github.com/andresnator/opencode-graphify-init/issues/7)) ([cb7e7d1](https://github.com/andresnator/opencode-graphify-init/commit/cb7e7d1efac9bd6fc07c6b4ec229e8430941e74b))
+
 ## [0.1.5](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.4...v0.1.5) (2026-08-27)
 
 
