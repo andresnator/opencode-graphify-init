@@ -41,3 +41,34 @@ Name non-trivial tests `should...When...` and use visible Given, When, and Then 
 Use `type(scope)!: description`. Supported types are `build`, `chore`, `ci`, `deps`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, and `test`.
 
 Describe user impact and list automated and manual evidence. Release Please creates stable GitHub releases; `.github/workflows/publish.yml` publishes them to npm through Trusted Publishing. Never add an npm token to the repository.
+
+## Request an explicit release
+
+When a public behavior change was merged under a non-releasing commit type,
+request a version explicitly instead of labeling documentation as a feature.
+Release Please supports a `Release-As` footer in the commit body:
+
+```text
+chore: request release 0.2.0
+
+Release-As: 0.2.0
+```
+
+1. Open a reviewed PR explaining the target version and user-facing changes.
+2. When squash-merging, preserve the footer in the final commit body; a footer
+   only in the PR description is not sufficient.
+3. Wait for Release Please to open the version/changelog PR. Review its release
+   notes, compatibility impact, and CI before merging it.
+4. Merging that release PR creates the GitHub release and triggers npm publishing.
+   Check the publish workflow before announcing availability.
+
+For the code-only transition in PR #25, the proposed next version is `0.2.0`:
+legacy documentation indexing is removed, authorized indexes are rebuilt, and
+uncertain locks require manual recovery. Include these changes in the release
+notes even though the original commit was classified as `refactor`.
+
+Do not manually bump the package or manifest for this request, create a tag, or
+publish to npm. Let the subsequent release PR own those changes.
+
+Reference: [Release Please: changing the version number](https://github.com/googleapis/release-please#how-do-i-change-the-version-number).
+
