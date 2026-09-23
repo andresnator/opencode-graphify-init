@@ -71,4 +71,3 @@ Do not manually bump the package or manifest for this request, create a tag, or
 publish to npm. Let the subsequent release PR own those changes.
 
 Reference: [Release Please: changing the version number](https://github.com/googleapis/release-please#how-do-i-change-the-version-number).
-
