@@ -13,6 +13,9 @@ async function shouldRegisterTheBundledCommandWhenNoCommandExists() {
   assert.match(config.command["graphify-index"].description, /explicit human consent/i)
   assert.match(config.command["graphify-index"].template, /You are running `\/graphify-index`/)
   assert.match(config.command["graphify-index"].template, /Never run `graphify update`/)
+  assert.match(config.command["graphify-index"].template, /graphify extract \. --code-only/)
+  assert.match(config.command["graphify-index"].template, /policyVersion/)
+  assert.doesNotMatch(config.command["graphify-index"].template, /\[--code-only \| --backend|Choose code-only or docs mode/)
 }
 
 async function shouldSilentlyPreserveAnExistingCommandWhenTheNameIsAlreadyOwned() {

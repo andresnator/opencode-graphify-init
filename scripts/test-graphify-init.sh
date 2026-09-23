@@ -96,6 +96,12 @@ cleanup_fake_builders() {
     : >"$state_dir/release"
     terminate_pid "$pid"
   done < <(find "$SUITE_DIR/repos" -type f -path '*/.fake-graphify/build.pid' -print0 2>/dev/null)
+  while IFS= read -r -d '' pid_file; do
+    state_dir=$(dirname "$pid_file")
+    pid=$(<"$pid_file")
+    : >"$state_dir/global-release"
+    terminate_pid "$pid"
+  done < <(find "$SUITE_DIR/repos" -type f -path '*/.fake-graphify/global.pid' -print0 2>/dev/null)
 }
 
 cleanup_processes() {
@@ -444,6 +450,12 @@ plant_semantic_marker() {
   : >"$root/.ai/graphify-out/.graphify_semantic_marker"
 }
 
+plant_current_policy() {
+  local root=$1
+  plant_mode "$root" code-only
+  printf '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}\n' >"$root/.ai/graphify-out/.opencode-index-mode"
+}
+
 assert_mode_file() {
   local root=$1
   local expected=$2
@@ -511,8 +523,37 @@ command_name=${1:-}
 register_global() {
   local tag=$1
   local graph=$2
+  if [[ "$tag" == global-warn-repo && ! -f "$(dirname "$(dirname "$(dirname "$graph")")")/.fake-graphify/global-recovered" ]]; then
+    echo 'synthetic global add failure' >&2; return 9
+  fi
   mkdir -p "$HOME/.graphify"
-  printf '%s %s\n' "$tag" "$graph" >>"$HOME/.graphify/global-graph.json"
+  python3 - "$HOME/.graphify" "$tag" "$graph" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+directory, tag, graph = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+manifest_path = directory / 'global-manifest.json'
+manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {'version': 1, 'repos': {}}
+manifest['repos'][tag] = {'source_path': str(graph.resolve()), 'node_count': len(json.loads(graph.read_text())['nodes'])}
+manifest_path.write_text(json.dumps(manifest))
+(directory / 'global-graph.json').write_text(json.dumps({'nodes': [], 'links': []}))
+PY
+}
+
+remove_global() {
+  local tag=$1
+  python3 - "$HOME/.graphify" "$tag" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+directory, tag = Path(sys.argv[1]), sys.argv[2]
+manifest_path = directory / 'global-manifest.json'
+manifest = json.loads(manifest_path.read_text())
+del manifest['repos'][tag]
+manifest_path.write_text(json.dumps(manifest))
+PY
 }
 
 write_graph() {
@@ -527,6 +568,11 @@ import sys
 
 target, commit, count = sys.argv[1:]
 graph = {"nodes": [{"id": f"n{i}"} for i in range(int(count))], "links": []}
+# The real CLI retains old document nodes when graph.json is reused incrementally.
+from pathlib import Path
+if Path(target).exists():
+    old = json.loads(Path(target).read_text())
+    graph['nodes'].extend(node for node in old.get('nodes', []) if node.get('type') == 'document')
 if commit:
     graph["built_at_commit"] = commit
 with open(target, "w", encoding="utf-8") as handle:
@@ -540,14 +586,26 @@ case "$command_name" in
     printf 'graphify 0.0.0-fake\n'
     ;;
   global)
-    # global add <graph.json> --as <tag>
-    printf 'global-add|%s|%s\n' "${3:-}" "${5:-}" >>"$FAKE_GRAPHIFY_LOG"
-    [[ "${2:-}" == add ]] || { echo "unexpected global subcommand: ${2:-}" >&2; exit 64; }
-    register_global "${5:-}" "${3:-}"
+    if [[ "${2:-}" == add ]]; then
+      printf 'global-add|%s|%s\n' "${3:-}" "${5:-}" >>"$FAKE_GRAPHIFY_LOG"
+      if [[ "${5:-}" == held-global-repo ]]; then
+        state_dir="$(dirname "$(dirname "$(dirname "${3:-}")")")/.fake-graphify"
+        mkdir -p "$state_dir"
+        printf '%s\n' "$$" >"$state_dir/global.pid"
+        : >"$state_dir/global-started"
+        until [[ -f "$state_dir/global-release" ]]; do sleep 0.05; done
+      fi
+      register_global "${5:-}" "${3:-}"
+    elif [[ "${2:-}" == remove ]]; then
+      printf 'global-remove|%s\n' "${3:-}" >>"$FAKE_GRAPHIFY_LOG"
+      remove_global "${3:-}"
+    else
+      echo "unexpected global subcommand: ${2:-}" >&2; exit 64
+    fi
     ;;
   extract)
     root=${2:-$PWD}
-    repo_name=$(basename "$root")
+    repo_name=$(basename "$(cd "$root" && pwd -P)")
     state_dir="$root/.fake-graphify"
     mkdir -p "$state_dir"
     printf '%s|%s|%s\n' "$command_name" "$root" "$*" >>"$FAKE_GRAPHIFY_LOG"
@@ -604,6 +662,7 @@ case "$command_name" in
     # Tests that need to observe an in-flight build pre-create the hold marker; every
     # other repository builds straight through so the common cases stay simple.
     if [[ -f "$state_dir/hold" ]]; then
+      if [[ "$repo_name" == command-held-repo ]]; then trap '' TERM; fi
       printf '%s\n' "$$" >"$state_dir/build.pid"
       trap 'rm -f "$state_dir/build.pid"' EXIT
       : >"$state_dir/build-started"
@@ -652,6 +711,24 @@ case "$command_name" in
 esac
 FAKE_GRAPHIFY
 chmod +x "$FAKE_BIN_DIR/graphify"
+
+plant_global_owner() {
+  local tag=$1
+  local graph=$2
+  mkdir -p "$HOME_DIR/.graphify"
+  python3 - "$HOME_DIR/.graphify" "$tag" "$graph" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+directory, tag, graph = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+manifest_path = directory / 'global-manifest.json'
+manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {'version': 1, 'repos': {}}
+manifest['repos'][tag] = {'source_path': str(graph.resolve())}
+manifest_path.write_text(json.dumps(manifest))
+(directory / 'global-graph.json').write_text(json.dumps({'nodes': [], 'links': []}))
+PY
+}
 
 mkdir -p "$TARGET_DIR"
 jq -n --arg plugin "file://$ROOT_DIR/src/server.ts" '{plugin: [$plugin]}' > "$TARGET_DIR/opencode.json"
@@ -707,8 +784,9 @@ shouldKeepConfigResponsiveWhileBuildingInBackground() {
   grep -Fxq '.ai/graphify-out' "$root/.git/info/exclude" || fail "graph output was not Git-excluded"
   [[ $(count_extract_calls "$root") -eq 1 ]] || fail "expected one extract call for background case"
   # A fresh extract relocates output under .ai/ and registers the repo globally inline.
-  grep -Fxq "extract|$root|extract $root --code-only --global --as success-repo" "$FAKE_LOG" ||
-    fail "extract did not request a relocated code-only build merged into the global graph"
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
+    fail "extract did not request a relocated code-only build"
+  [[ $(count_global_add_calls "$root") -eq 1 ]] || fail "owned global contribution was not added"
   # The relocation travels as GRAPHIFY_OUT, not --out: only the env var is also read by the
   # MCP server when it resolves a project_path query, so writer and reader stay in agreement.
   grep -Fxq 'env|extract|.ai/graphify-out' "$FAKE_LOG" ||
@@ -718,7 +796,7 @@ shouldKeepConfigResponsiveWhileBuildingInBackground() {
   [[ ! -e "$root/graphify-out" ]] || fail "a root-level graphify-out/ leaked outside .ai/"
   # The extract lock lives only as long as the extract, and the consent record round-trips.
   [[ ! -e "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "extract lock was left behind"
-  assert_mode_file "$root" '{"mode":"code-only"}'
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
 
@@ -728,6 +806,7 @@ shouldStaySilentWhenGraphMatchesHeadCommit() {
   local size_before
   root=$(make_committed_repo fresh-graph-repo)
   plant_graph "$root" head
+  plant_current_policy "$root"
   size_before=$(log_size)
   start_server fresh-graph 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
 
@@ -756,7 +835,7 @@ shouldHintOncePerSessionInsteadOfFirstIndexing() {
   # no state written — first indexing belongs to the human-run command.
   wait_for_pattern "No Graphify graph exists for unindexed-repo yet." "$EVENTS_FILE"
   assert_toast \
-    "No Graphify graph exists for unindexed-repo yet. Run /graphify-index to build one: code-only takes seconds; docs mode takes minutes and spends LLM tokens. Refreshes after that are incremental and automatic." \
+    "No Graphify graph exists for unindexed-repo yet. Run /graphify-index to authorize code-only indexing. Refreshes after that are incremental and automatic." \
     info \
     "$HINT_DURATION_MS"
   [[ $(log_size) -eq "$size_before" ]] || fail "consentless repository still invoked Graphify"
@@ -841,22 +920,21 @@ shouldRefreshStaleGraphWithIncrementalExtract() {
 
   # Then: the refresh is one relocated extract call — extract is natively incremental,
   # and `graphify update` (which cannot honour --out) must never run.
-  wait_for_pattern "Graphify is updating the stale-graph-repo code graph in the background." "$EVENTS_FILE"
+  wait_for_pattern "Graphify is building the code graph for stale-graph-repo in the background." "$EVENTS_FILE"
   assert_toast \
-    "Graphify is updating the stale-graph-repo code graph in the background. You can keep working." \
+    "Graphify is building the code graph for stale-graph-repo in the background. You can keep working." \
     info \
     "$INFO_DURATION_MS"
   wait_for_pattern "Graphify graph for stale-graph-repo is ready: $FAKE_NODE_COUNT nodes" "$EVENTS_FILE"
   [[ $(count_extract_calls "$root") -eq 1 ]] || fail "stale graph was not refreshed by exactly one extract"
-  grep -Fxq "extract|$root|extract $root --code-only --global --as stale-graph-repo" "$FAKE_LOG" ||
-    fail "refresh did not run as a relocated code-only extract with inline global merge"
-  # The inline --global merge replaces the old standalone `global add` step entirely.
-  [[ $(count_global_add_calls "$root") -eq 0 ]] || fail "refresh still used a standalone global add"
-  grep -Fq "stale-graph-repo $root/.ai/graphify-out/graph.json" "$GLOBAL_GRAPH" ||
-    fail "refreshed graph was not re-registered globally"
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
+    fail "legacy refresh was not a clean code-only extract"
+  [[ $(count_global_add_calls "$root") -eq 1 ]] || fail "owned graph was not registered"
+  jq -e --arg path "$root/.ai/graphify-out/graph.json" '.repos["stale-graph-repo"].source_path == $path' "$HOME_DIR/.graphify/global-manifest.json" >/dev/null ||
+    fail "refreshed graph was not registered globally"
   [[ ! -e "$root/graphify-out" ]] || fail "refresh recreated a root-level graphify-out/"
-  # The fallback-derived decision is persisted, migrating the legacy repo off the derivation.
-  assert_mode_file "$root" '{"mode":"code-only"}'
+  # The legacy graph was rebuilt and its successful policy recorded.
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
 
@@ -895,13 +973,13 @@ shouldRefreshCodeOnlyDespiteAmbientDocsEnvironment() {
 
   # Then
   wait_for_pattern "Graphify graph for env-loses-repo is ready" "$EVENTS_FILE"
-  grep -Fxq "extract|$root|extract $root --code-only --global --as env-loses-repo" "$FAKE_LOG" ||
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
     fail "ambient docs environment overrode the recorded code-only mode"
   cleanup_processes
 }
 
-shouldRefreshWithDocsBackendWhenModeFileRecordsDocs() {
-  # Given a stale graph whose mode file records the docs decision with a pinned backend.
+shouldMigrateLegacyDocsBackendWhenModeFileRecordsDocs() {
+  # Given a stale graph whose old mode file records docs and a pinned backend.
   local root
   root=$(make_committed_repo docs-refresh-repo)
   plant_graph "$root" "$STALE_COMMIT"
@@ -911,17 +989,16 @@ shouldRefreshWithDocsBackendWhenModeFileRecordsDocs() {
   # When
   request_config "$root" "$SUITE_DIR/docs-refresh.config.json"
 
-  # Then the refresh keeps the docs pass and the recorded backend, without any env help.
+  # Then migration ignores the backend and removes old generated state before extraction.
   wait_for_pattern "Graphify graph for docs-refresh-repo is ready" "$EVENTS_FILE"
-  grep -Fxq "extract|$root|extract $root --backend zen --global --as docs-refresh-repo" "$FAKE_LOG" ||
-    fail "docs refresh did not honour the recorded backend"
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
+    fail "legacy docs backend controlled extraction"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
 
-shouldDeriveDocsRefreshFromSemanticMarkerWhenModeFileIsAbsent() {
-  # Given a pre-command docs graph: stale, no mode file, but the semantic marker Graphify
-  # writes when an LLM pass spent tokens. The backend pin comes from the same env var that
-  # built the graph, so credentials keep routing to the original backend.
+shouldMigrateLegacySemanticGraphWhenModeFileIsAbsent() {
+  # Given a pre-command docs graph with a semantic marker but no mode file.
   local root
   root=$(make_committed_repo legacy-docs-repo)
   plant_graph "$root" "$STALE_COMMIT"
@@ -931,11 +1008,12 @@ shouldDeriveDocsRefreshFromSemanticMarkerWhenModeFileIsAbsent() {
   # When
   request_config "$root" "$SUITE_DIR/legacy-docs.config.json"
 
-  # Then the refresh runs in docs mode and the derived decision is persisted.
+  # Then the graph is cleanly rebuilt as code without choosing any backend.
   wait_for_pattern "Graphify graph for legacy-docs-repo is ready" "$EVENTS_FILE"
-  grep -Fxq "extract|$root|extract $root --backend opencode --global --as legacy-docs-repo" "$FAKE_LOG" ||
-    fail "semantic marker did not derive a docs refresh"
-  assert_mode_file "$root" '{"mode":"docs","backend":"opencode"}'
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
+    fail "semantic marker re-enabled docs mode"
+  [[ ! -e "$root/.ai/graphify-out/.graphify_semantic_marker" ]] || fail "semantic marker survived migration"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
 
@@ -963,6 +1041,7 @@ shouldKeepExistingGraphWhenRepositoryHasNoCommits() {
   local size_before
   root=$(make_repo uncommitted-repo)
   plant_graph "$root" ""
+  plant_current_policy "$root"
   size_before=$(log_size)
   start_server uncommitted 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
 
@@ -1007,7 +1086,7 @@ shouldToastErrorWhenRefreshFails() {
   request_config "$root" "$SUITE_DIR/refresh-fail.config.json"
 
   # Then: recovery advertises the manual rebuild, and nothing is registered globally.
-  wait_for_pattern "Graphify is updating the refresh-fail-repo code graph in the background." "$EVENTS_FILE"
+  wait_for_pattern "Graphify is building the code graph for refresh-fail-repo in the background." "$EVENTS_FILE"
   wait_for_pattern "Graphify indexing failed for refresh-fail-repo, but this session is still operational." "$EVENTS_FILE"
   assert_toast \
     "Graphify indexing failed for refresh-fail-repo, but this session is still operational. Run: GRAPHIFY_OUT=.ai/graphify-out graphify extract '$root' --code-only" \
@@ -1040,10 +1119,10 @@ shouldReportEmptyWhenRepositoryLosesAllCode() {
   ! grep -Fq '"variant":"error"' "$EVENTS_FILE" || fail "shrunk repository produced an error toast"
   ! grep -Fq "shrink-empty-repo " "$GLOBAL_GRAPH" 2>/dev/null || fail "shrunk repository was registered globally"
   [[ -f "$root/.ai/graphify-out/.opencode-empty-corpus" ]] || fail "empty-corpus marker was not recorded"
-  [[ -f "$root/.ai/graphify-out/graph.json" ]] || fail "shrink unexpectedly deleted the previous graph"
+  [[ ! -e "$root/.ai/graphify-out/graph.json" ]] || fail "empty corpus retained legacy document graph"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
 
-  # And reopening stays silent even though the stale-stamped graph is still on disk:
-  # the empty-corpus marker wins, so the shrunk repo is not retried every session.
+  # And reopening stays silent because the versioned empty result is current.
   start_server shrink-empty-reopen 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
   request_config "$root" "$SUITE_DIR/shrink-empty-reopen.config.json"
   sleep 1
@@ -1195,7 +1274,7 @@ shouldClassifyEmptyCorpusBehindVerboseOutput() {
 }
 
 shouldTreatDocsCensusWithBackendErrorAsFailureNotEmptyCorpus() {
-  # Given a docs-mode run that dies on backend credentials after a census reporting
+  # Given a legacy docs record and a simulated failure after a census reporting
   # "0 code, 1 docs": a fixable failure. Classifying it by the census would brand the
   # repository an empty corpus and suppress every retry at this commit.
   local root
@@ -1206,19 +1285,21 @@ shouldTreatDocsCensusWithBackendErrorAsFailureNotEmptyCorpus() {
   # When
   request_config "$root" "$SUITE_DIR/credential-fail.config.json"
 
-  # Then: reported as a failure with the docs recovery command, never as an empty corpus.
+  # Then: reported as a failure with code-only recovery, never as an empty corpus.
   wait_for_pattern "Graphify indexing failed for credential-fail-repo" "$EVENTS_FILE"
   assert_toast \
-    "Graphify indexing failed for credential-fail-repo, but this session is still operational. Run: GRAPHIFY_OUT=.ai/graphify-out graphify extract '$root' --backend zen" \
+    "Graphify indexing failed for credential-fail-repo, but this session is still operational. Run: GRAPHIFY_OUT=.ai/graphify-out graphify extract '$root' --code-only" \
     error \
     "$RECOVERY_DURATION_MS"
   [[ ! -e "$root/.ai/graphify-out/.opencode-empty-corpus" ]] || fail "backend failure recorded an empty-corpus marker"
 
-  # And the next session retries instead of honoring a marker that should not exist.
+  # A failed child may have untracked writers. Keep the lock until quiescence is
+  # independently established, rather than guessing from the recorded PID.
+  [[ -f "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "failed extractor lost its safety lock"
   start_server credential-fail-retry 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
   request_config "$root" "$SUITE_DIR/credential-fail-retry.config.json"
-  wait_for_pattern "Graphify indexing failed for credential-fail-repo" "$EVENTS_FILE"
-  [[ $(count_extract_calls "$root") -eq 2 ]] || fail "backend failure was not retried on the next session"
+  sleep 1
+  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "failure was automatically retried through retained lock"
   cleanup_processes
 }
 
@@ -1307,9 +1388,8 @@ shouldSummarizeAggregateFailuresWithIndexCommandHint() {
   cleanup_processes
 }
 
-shouldBuildDocsGraphWhenModeFileRequestsDocsWithBackend() {
-  # Given a first build (graph deleted after /graphify-index, say) whose recorded decision
-  # is docs mode with a pinned backend — no docs env vars anywhere.
+shouldBuildCodeGraphWhenLegacyModeRequestsDocsWithBackend() {
+  # Given a first build with old docs consent and a pinned backend.
   local root
   root=$(make_committed_repo docs-mode-repo)
   plant_mode "$root" docs opencode
@@ -1318,16 +1398,16 @@ shouldBuildDocsGraphWhenModeFileRequestsDocsWithBackend() {
   # When
   request_config "$root" "$SUITE_DIR/docs-mode.config.json"
 
-  # Then extract drops --code-only (the semantic docs pass is on) and pins the backend.
+  # Then legacy consent authorizes only code indexing.
   wait_for_pattern "Graphify graph for docs-mode-repo is ready: $FAKE_NODE_COUNT nodes" "$EVENTS_FILE"
-  grep -Fxq "extract|$root|extract $root --backend opencode --global --as docs-mode-repo" "$FAKE_LOG" ||
-    fail "docs mode did not run a full extract with the recorded backend"
-  assert_mode_file "$root" '{"mode":"docs","backend":"opencode"}'
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
+    fail "legacy docs mode controlled extraction"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
 
-shouldBuildDocsGraphWithAutoDetectedBackendWhenUnpinned() {
-  # Given a recorded docs decision without a backend pin: Graphify auto-detects one.
+shouldBuildCodeGraphWhenLegacyDocsBackendIsUnpinned() {
+  # Given a recorded docs decision without a backend pin.
   local root
   root=$(make_committed_repo docs-auto-repo)
   plant_mode "$root" docs
@@ -1336,17 +1416,16 @@ shouldBuildDocsGraphWithAutoDetectedBackendWhenUnpinned() {
   # When
   request_config "$root" "$SUITE_DIR/docs-auto.config.json"
 
-  # Then extract carries neither --code-only nor --backend.
+  # Then the same code-only policy applies.
   wait_for_pattern "Graphify graph for docs-auto-repo is ready: $FAKE_NODE_COUNT nodes" "$EVENTS_FILE"
-  grep -Fxq "extract|$root|extract $root --global --as docs-auto-repo" "$FAKE_LOG" ||
-    fail "unpinned docs mode did not run a plain full extract"
-  assert_mode_file "$root" '{"mode":"docs"}'
+  grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
+    fail "unpinned legacy docs mode controlled extraction"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
 
-shouldMirrorDocsModeInRecoveryCommand() {
-  # Given a failing build under a recorded docs decision: the advertised manual command must
-  # reproduce what the plugin ran, not fall back to --code-only.
+shouldUseCodeOnlyRecoveryForLegacyDocsFailure() {
+  # Given a failing build under a recorded legacy docs decision.
   local root="$SUITE_DIR/repos/docs-fail/build-fail-repo"
   mkdir -p "$root"
   git_init "$root"
@@ -1362,7 +1441,7 @@ shouldMirrorDocsModeInRecoveryCommand() {
   # Then
   wait_for_pattern "Graphify indexing failed for build-fail-repo" "$EVENTS_FILE"
   assert_toast \
-    "Graphify indexing failed for build-fail-repo, but this session is still operational. Run: GRAPHIFY_OUT=.ai/graphify-out graphify extract '$root' --backend opencode" \
+    "Graphify indexing failed for build-fail-repo, but this session is still operational. Run: GRAPHIFY_OUT=.ai/graphify-out graphify extract '$root' --code-only" \
     error \
     "$RECOVERY_DURATION_MS"
   cleanup_processes
@@ -1406,8 +1485,10 @@ shouldDoNothingWhenOptedOut() {
 shouldSkipGlobalRegistrationWhenOptedOut() {
   # Given OPENCODE_GRAPHIFY_GLOBAL=0 with the initializer itself still on.
   local root
+  local before
   root=$(make_committed_repo global-opt-out-repo)
   plant_mode "$root" code-only
+  before=$(cksum "$HOME_DIR/.graphify/global-manifest.json")
   start_server global-opt-out 1 "$FAKE_BIN_DIR:/usr/bin:/bin" 0
 
   # When
@@ -1418,8 +1499,8 @@ shouldSkipGlobalRegistrationWhenOptedOut() {
   grep -Fxq "extract|$root|extract $root --code-only" "$FAKE_LOG" ||
     fail "opted-out build did not run as a plain local extract"
   [[ $(count_global_add_calls "$root") -eq 0 ]] || fail "opted-out build still registered globally"
-  ! grep -Fq "global-opt-out-repo $root/.ai/graphify-out/graph.json" "$GLOBAL_GRAPH" 2>/dev/null ||
-    fail "opted-out build still reached the global graph"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  [[ "$(cksum "$HOME_DIR/.graphify/global-manifest.json")" == "$before" ]] || fail "opted-out build changed global state"
   cleanup_processes
 }
 
@@ -1441,17 +1522,14 @@ shouldRegisterEveryRepositoryInTheGlobalGraph() {
 
   # Then: both land in one global graph, each under its own repository tag.
   wait_for_file "$GLOBAL_GRAPH"
-  grep -Fq "global-first-repo $first/.ai/graphify-out/graph.json" "$GLOBAL_GRAPH" ||
-    fail "first repository is missing from the global graph"
-  grep -Fq "global-second-repo $second/.ai/graphify-out/graph.json" "$GLOBAL_GRAPH" ||
-    fail "second repository is missing from the global graph"
+  jq -e --arg first "$first/.ai/graphify-out/graph.json" --arg second "$second/.ai/graphify-out/graph.json" \
+    '.repos["global-first-repo"].source_path == $first and .repos["global-second-repo"].source_path == $second' \
+    "$HOME_DIR/.graphify/global-manifest.json" >/dev/null || fail "repository contributions missing"
   cleanup_processes
 }
 
 shouldWarnWhenGlobalMergeFailsDespiteExitZero() {
-  # Given an extract whose --global merge fails: real Graphify 0.9.28 prints the warning
-  # to stderr and still exits 0, so a success-only reading would stamp the local graph
-  # fresh and never retry the registration.
+  # Given a local extract succeeds while the scoped global add fails.
   local root
   root=$(make_committed_repo global-warn-repo)
   plant_mode "$root" code-only
@@ -1468,7 +1546,18 @@ shouldWarnWhenGlobalMergeFailsDespiteExitZero() {
     "Graphify could not merge global-warn-repo into the global graph; cross-repository queries stay stale. Run: graphify global add '$root/.ai/graphify-out/graph.json' --as global-warn-repo" \
     warning \
     "$RECOVERY_DURATION_MS"
-  ! grep -Fq "global-warn-repo " "$GLOBAL_GRAPH" 2>/dev/null || fail "failed merge unexpectedly landed in the global graph"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  [[ $(count_global_add_calls "$root") -eq 1 ]] || fail "expected one failed global add"
+  # Failure retains the global lock: a subsequent session may not treat PID metadata
+  # or an apparently recovered CLI as permission to take over uncertain writers.
+  [[ -f "$HOME_DIR/.graphify/.opencode-global-lock" ]] || fail "failed global child lost its lock"
+  : >"$root/.fake-graphify/global-recovered"
+  start_server global-warn-retry 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/global-warn-retry.config.json"
+  wait_for_pattern "Graphify could not merge global-warn-repo" "$EVENTS_FILE"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  [[ $(count_global_add_calls "$root") -eq 1 ]] || fail "failed global lock was automatically reclaimed"
+  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "pending global retry re-extracted fresh local graph"
   cleanup_processes
 }
 
@@ -1547,9 +1636,9 @@ shouldAggregateNestedRepositoriesUnderPlainRoot() {
   grep -Fxq '.ai/graphify-out' "$repo_b/.git/info/exclude" || fail "repo-b output was not Git-excluded"
   # Each nested repository is registered under its own tag, not the aggregate root's,
   # and each keeps its output under its own .ai/.
-  grep -Fxq "extract|$repo_a|extract $repo_a --code-only --global --as repo-a" "$FAKE_LOG" ||
+  grep -Fxq "extract|$repo_a|extract $repo_a --code-only" "$FAKE_LOG" ||
     fail "repo-a was not registered under its own global tag"
-  grep -Fxq "extract|$repo_b|extract $repo_b --code-only --global --as repo-b" "$FAKE_LOG" ||
+  grep -Fxq "extract|$repo_b|extract $repo_b --code-only" "$FAKE_LOG" ||
     fail "repo-b was not registered under its own global tag"
   ! grep -Fq "Graphify is building the code graph for repo-a" "$EVENTS_FILE" || fail "aggregate emitted a per-repo start toast"
   cleanup_processes
@@ -1594,7 +1683,7 @@ shouldSkipExtractWhileAnotherLiveSessionHoldsTheLock() {
   cleanup_processes
 }
 
-shouldReplaceStaleLockLeftByDeadSession() {
+shouldRetainStaleLockLeftByDeadSession() {
   # Given a stale graph whose lock names a PID that no longer exists (crashed session).
   local root
   local dead_pid
@@ -1610,10 +1699,11 @@ shouldReplaceStaleLockLeftByDeadSession() {
   # When
   request_config "$root" "$SUITE_DIR/stale-lock.config.json"
 
-  # Then the dead lock is replaced, the refresh runs, and the lock is released after it.
-  wait_for_pattern "Graphify graph for stale-lock-repo is ready" "$EVENTS_FILE"
-  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "stale lock blocked the refresh"
-  [[ ! -e "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "lock was not released after the refresh"
+  # Then neither claimant may reclaim a stale lock: an operator must first quiesce
+  # affected sessions and Graphify processes before explicit recovery.
+  sleep 1
+  [[ $(count_extract_calls "$root") -eq 0 ]] || fail "stale lock was unsafely reclaimed"
+  grep -Fxq "$dead_pid" "$root/.ai/graphify-out/.opencode-extract-lock" || fail "stale lock was replaced"
   cleanup_processes
 }
 
@@ -1686,11 +1776,11 @@ shouldKillExtractThatExceedsItsTimeBudget() {
   builder_pid=$(<"$root/.fake-graphify/build.pid")
   kill -0 "$builder_pid" 2>/dev/null || fail "fake builder was not running before the budget expired"
 
-  # Then the budget kills the child, the failure is reported, and the lock is free for the
-  # next session instead of outliving it.
+  # Then the budget requests termination, reports failure, and retains the lock until
+  # process-tree quiescence is independently established.
   wait_for_pid_exit "$builder_pid"
   wait_for_pattern "Graphify indexing failed for timeout-repo" "$EVENTS_FILE"
-  [[ ! -e "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "timed-out extract did not release the lock"
+  [[ -f "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "timed-out extract released uncertain lock"
   cleanup_processes
 }
 
@@ -1713,6 +1803,394 @@ shouldWarnWhenBinaryIsMissing() {
   cleanup_processes
 }
 
+shouldRebuildFreshUnversionedGraph() {
+  # Given a fresh, previously authorized graph without code-only policy proof.
+  local root
+  root=$(make_committed_repo legacy-fresh-repo)
+  plant_graph "$root" head
+  plant_mode "$root" docs zen
+  jq '.nodes += [{"id":"legacy-document","type":"document"}]' "$root/.ai/graphify-out/graph.json" >"$root/.ai/graphify-out/graph.tmp"
+  mv "$root/.ai/graphify-out/graph.tmp" "$root/.ai/graphify-out/graph.json"
+
+  # When
+  start_server legacy-fresh 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/legacy-fresh.config.json"
+
+  # Then
+  wait_for_pattern "extract|$root|" "$FAKE_LOG"
+  grep -Fq "extract $root --code-only" "$FAKE_LOG" || fail "legacy graph was not rebuilt as code-only"
+  wait_for_pattern "Graphify graph for legacy-fresh-repo is ready" "$EVENTS_FILE"
+  jq -e '[.nodes[] | select(.type == "document")] | length == 0' "$root/.ai/graphify-out/graph.json" >/dev/null ||
+    fail "legacy document node survived incremental reuse"
+  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "migration did not extract once"
+  start_server legacy-fresh-reopen 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/legacy-fresh-reopen.config.json"
+  sleep 1
+  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "successful migration repeated"
+  cleanup_processes
+}
+
+shouldRejectUnrecognizedVersionedModeAsPolicyProof() {
+  # Given a claimed version on an old docs-mode record; only code-only is valid proof.
+  local root
+  root=$(make_committed_repo false-policy-repo)
+  plant_graph "$root" head
+  printf '{"mode":"docs","policyVersion":1,"pendingGlobal":false}\n' >"$root/.ai/graphify-out/.opencode-index-mode"
+
+  # When
+  start_server false-policy 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/false-policy.config.json"
+
+  # Then
+  wait_for_pattern "extract|$root|" "$FAKE_LOG"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
+  cleanup_processes
+}
+
+shouldReconcilePendingGlobalAfterOptOut() {
+  # Given an existing owned global contribution and a local update with integration off.
+  local root
+  local prior
+  root=$(make_committed_repo pending-repo)
+  plant_graph "$root" "$STALE_COMMIT"
+  plant_global_owner pending-repo "$root/.ai/graphify-out/graph.json"
+  prior=$(cksum "$HOME_DIR/.graphify/global-manifest.json")
+  start_server pending-disabled 1 "$FAKE_BIN_DIR:/usr/bin:/bin" 0
+
+  # When
+  request_config "$root" "$SUITE_DIR/pending-disabled.config.json"
+  wait_for_pattern "Graphify graph for pending-repo is ready" "$EVENTS_FILE"
+
+  # Then
+  [[ "$(cksum "$HOME_DIR/.graphify/global-manifest.json")" == "$prior" ]] || fail "disabled global modified shared manifest"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  start_server pending-enabled 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/pending-enabled.config.json"
+  local attempt
+  for attempt in $(seq 1 150); do
+    [[ "$(jq -r .pendingGlobal "$root/.ai/graphify-out/.opencode-index-mode")" == false ]] && break
+    sleep 0.1
+  done
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
+  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "reconciliation repeated local extraction"
+  [[ $(count_global_add_calls "$root") -eq 1 ]] || fail "enabled global did not replace owned entry"
+  cleanup_processes
+}
+
+shouldPreserveForeignContributionOnTagCollision() {
+  # Given a different repository already registered under the target basename.
+  local root
+  local foreign
+  local prior
+  root=$(make_committed_repo collision-repo)
+  foreign=$(make_committed_repo foreign-repo)
+  plant_graph "$foreign" head
+  plant_global_owner collision-repo "$foreign/.ai/graphify-out/graph.json"
+  prior=$(cksum "$HOME_DIR/.graphify/global-manifest.json")
+  plant_mode "$root" code-only
+
+  # When
+  start_server collision 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/collision.config.json"
+
+  # Then
+  wait_for_pattern "Graphify could not merge collision-repo" "$EVENTS_FILE"
+  [[ "$(cksum "$HOME_DIR/.graphify/global-manifest.json")" == "$prior" ]] || fail "collision overwrote foreign contribution"
+  [[ $(count_global_add_calls "$root") -eq 0 ]] || fail "foreign tag was handed to global add"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  cleanup_processes
+}
+
+shouldRemoveOnlyOwnedGlobalContributionWhenLegacyCorpusBecomesEmpty() {
+  # Given an old document graph registered alongside a second repository.
+  local root
+  local other
+  root=$(make_committed_repo legacy-empty-nocode)
+  other=$(make_committed_repo retained-repo)
+  plant_graph "$root" head
+  plant_graph "$other" head
+  plant_global_owner legacy-empty-nocode "$root/.ai/graphify-out/graph.json"
+  plant_global_owner retained-repo "$other/.ai/graphify-out/graph.json"
+
+  # When
+  start_server legacy-empty 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/legacy-empty.config.json"
+
+  # Then
+  wait_for_pattern "Graphify found no indexable code in legacy-empty-nocode" "$EVENTS_FILE"
+  [[ $(count_calls 'global-remove|legacy-empty-nocode') -eq 1 ]] || fail "owned empty contribution was not removed"
+  [[ ! -e "$root/.ai/graphify-out/graph.json" ]] || fail "empty migration retained old graph"
+  jq -e '.repos["retained-repo"] != null and .repos["legacy-empty-nocode"] == null' \
+    "$HOME_DIR/.graphify/global-manifest.json" >/dev/null || fail "empty migration changed unrelated global owner"
+  cleanup_processes
+}
+
+shouldRebuildUnversionedEmptyMarkerWithoutLoop() {
+  # Given an old empty marker without a mode record; it authorizes one reconstruction.
+  local root
+  root=$(make_committed_repo old-empty-nocode)
+  mkdir -p "$root/.ai/graphify-out"
+  git -C "$root" rev-parse HEAD >"$root/.ai/graphify-out/.opencode-empty-corpus"
+
+  # When
+  start_server old-empty 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/old-empty.config.json"
+
+  # Then
+  wait_for_pattern "Graphify found no indexable code in old-empty-nocode" "$EVENTS_FILE"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
+  start_server old-empty-reopen 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/old-empty-reopen.config.json"
+  sleep 1
+  [[ $(count_extract_calls "$root") -eq 1 ]] || fail "old empty marker repeatedly rebuilt"
+  cleanup_processes
+}
+
+shouldRejectUnsafeSymlinkedGeneratedArtifact() {
+  # Given an authorized legacy graph whose cache is a symlink into unrelated fixture data.
+  local root
+  local outside="$SUITE_DIR/records-keep"
+  root=$(make_committed_repo unsafe-cache-repo)
+  plant_graph "$root" head
+  mkdir -p "$outside"
+  printf 'keep\n' >"$outside/important.txt"
+  ln -s "$outside" "$root/.ai/graphify-out/cache"
+
+  # When
+  start_server unsafe-cache 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/unsafe-cache.config.json"
+
+  # Then
+  wait_for_pattern "Graphify indexing failed for unsafe-cache-repo" "$EVENTS_FILE"
+  [[ $(count_extract_calls "$root") -eq 0 ]] || fail "unsafe generated path was extracted"
+  [[ "$(<"$outside/important.txt")" == keep ]] || fail "unsafe cache cleanup affected outside fixture"
+  [[ "$(jq -r '.policyVersion // ""' "$root/.ai/graphify-out/.opencode-index-mode" 2>/dev/null || :)" != 1 ]] ||
+    fail "unsafe cleanup marked migration successful"
+  cleanup_processes
+}
+
+shouldKeepPolicyUnversionedAfterInterruptedExtract() {
+  # Given a code-only migration held in flight until its extract deadline expires.
+  local root
+  root=$(make_committed_repo interrupted-repo)
+  plant_graph "$root" head
+  plant_mode "$root" docs zen
+  hold_builds "$root"
+  EXTRACT_TIMEOUT_MS=1000
+  start_server interrupted 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  EXTRACT_TIMEOUT_MS=unset
+
+  # When
+  request_config "$root" "$SUITE_DIR/interrupted.config.json"
+
+  # Then
+  wait_for_pattern "Graphify indexing failed for interrupted-repo" "$EVENTS_FILE"
+  assert_mode_file "$root" '{"mode":"docs","backend":"zen"}'
+  [[ ! -e "$root/.ai/graphify-out/graph.json" ]] || fail "interrupted legacy graph still advertised as active"
+  cleanup_processes
+}
+
+shouldRetainGlobalLockWhileOrphanedChildCanStillWrite() {
+  # Given an isolated global add held beyond the parent server's lifetime.
+  local root
+  local contender
+  local global_pid
+  root=$(make_committed_repo held-global-repo)
+  contender=$(make_committed_repo global-contender-repo)
+  # A previous failure intentionally retains its own global lock in the main sandbox.
+  HOME_DIR="$SUITE_DIR/home-held-global"
+  mkdir -p "$HOME_DIR"
+  plant_mode "$root" code-only
+  plant_mode "$contender" code-only
+  start_server held-global 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/held-global.config.json"
+  wait_for_file "$root/.fake-graphify/global.pid"
+  global_pid=$(<"$root/.fake-graphify/global.pid")
+
+  # When a hard-killed parent cannot execute its finally block.
+  kill -KILL "$SERVER_PID"
+  wait_for_pid_exit "$SERVER_PID"
+  SERVER_PID=""
+
+  # Then the still-running global child is recorded in the global lock, and a second
+  # repository must not enter the same global mutation while that child is held.
+  kill -0 "$global_pid" 2>/dev/null || fail "global child exited before contention probe"
+  grep -Fxq "$global_pid" "$HOME_DIR/.graphify/.opencode-global-lock" ||
+    fail "orphaned global child was not recorded in global lock"
+  start_server global-contender 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$contender" "$SUITE_DIR/global-contender.config.json"
+  wait_for_pattern "Graphify could not merge global-contender-repo" "$EVENTS_FILE"
+  [[ $(count_global_add_calls "$contender") -eq 0 ]] || fail "second mutation passed orphaned global child"
+  : >"$root/.fake-graphify/global-release"
+  wait_for_pid_exit "$global_pid"
+  cleanup_processes
+}
+
+shouldRetainCommandLockWhenSignaledChildIgnoresTermination() {
+  # Given the actual first-index shell recipe running a held fake Graphify that ignores TERM.
+  local root
+  local command_pid
+  local child_pid
+  root=$(make_committed_repo command-held-repo)
+  hold_builds "$root"
+  awk '/^   ```bash/{inside=1; next} inside && /^   ```/{exit} inside {sub(/^   /, ""); print}' \
+    "$ROOT_DIR/commands/graphify-index.md" >"$SUITE_DIR/command-workflow.sh"
+  ( cd "$root" && exec env PATH="$FAKE_BIN_DIR:/usr/bin:/bin" FAKE_GRAPHIFY_LOG="$FAKE_LOG" \
+    bash "$SUITE_DIR/command-workflow.sh" ) >"$SUITE_DIR/command-workflow.log" 2>&1 &
+  command_pid=$!
+  wait_for_file "$root/.fake-graphify/build.pid"
+  child_pid=$(<"$root/.fake-graphify/build.pid")
+
+  # When the shell receives TERM but its extractor continues to hold the build.
+  kill -TERM "$command_pid"
+  wait_for_pid_exit "$command_pid"
+
+  # Then the live extractor still owns a lock; it cannot be reclaimed as stale.
+  kill -0 "$child_pid" 2>/dev/null || fail "held extractor exited before signal assertion"
+  [[ -f "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "interrupted command removed live child lock"
+  grep -Fxq "$child_pid" "$root/.ai/graphify-out/.opencode-extract-lock" || fail "child pid missing from retained command lock"
+  release_builds "$root"
+  wait_for_pid_exit "$child_pid"
+  cleanup_processes
+}
+
+shouldReleaseCommandLockOnlyAfterVerifiedSuccess() {
+  # Given the same first-index shell recipe without an interrupted extractor.
+  local root
+  root=$(make_committed_repo command-success-repo)
+  awk '/^   ```bash/{inside=1; next} inside && /^   ```/{exit} inside {sub(/^   /, ""); print}' \
+    "$ROOT_DIR/commands/graphify-index.md" >"$SUITE_DIR/command-success.sh"
+
+  # When
+  ( cd "$root" && PATH="$FAKE_BIN_DIR:/usr/bin:/bin" FAKE_GRAPHIFY_LOG="$FAKE_LOG" \
+    bash "$SUITE_DIR/command-success.sh" ) >"$SUITE_DIR/command-success.log" 2>&1 ||
+      fail "successful command recipe failed: $(<"$SUITE_DIR/command-success.log")"
+
+  # Then
+  [[ ! -e "$root/.ai/graphify-out/.opencode-extract-lock" ]] || fail "verified command success retained own lock"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  cleanup_processes
+}
+
+shouldDenyCompetingStaleLockClaimsAtReadBarrier() {
+  # Given two claimants paused after reading the same dead lock, with the second unlink
+  # delayed until the first claimant has recreated a live lock. This forces the TOCTOU
+  # interleaving rather than relying on scheduler luck or a source-text assertion.
+  local source="$ROOT_DIR/src/server.ts"
+
+  # When executing the actual acquireLock function against a coordinated filesystem.
+  node --input-type=module - "$source" <<'JS'
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import fs from 'node:fs/promises'
+import ts from 'typescript'
+
+const source = await fs.readFile(process.argv[2], 'utf8')
+const match = source.match(/async function acquireLock\(lockPath: string\)[^{]*\{[\s\S]*?\n\}\n\nasync function acquireExtractLock/)
+assert.ok(match, 'lock implementation changed: update behavioral harness')
+const implementation = ts.transpileModule(match[0].replace(/\n\nasync function acquireExtractLock$/, ''), {
+  compilerOptions: { target: ts.ScriptTarget.ES2022 },
+}).outputText
+// Separate Node processes execute the real transpiled function. Parent-controlled FS RPC
+// pauses BOTH after reading the dead lock, then lets claimant A recreate a live lock
+// before claimant B's unlink. This reproduces the old lost-owner interleaving exactly.
+const workerCode = `
+const pending = new Map()
+let nextId = 0
+process.on('message', reply => {
+  const waiter = pending.get(reply.id)
+  if (!waiter) return
+  pending.delete(reply.id)
+  if (reply.error) waiter.reject(Object.assign(new Error(reply.error), { code: reply.error }))
+  else waiter.resolve(reply.value)
+})
+const rpc = op => new Promise((resolve, reject) => {
+  const id = ++nextId
+  pending.set(id, { resolve, reject })
+  process.send({ type: 'op', op, id })
+})
+const controlledFs = {
+  open: () => rpc('open'),
+  writeFile: () => rpc('writeFile'),
+  lstat: async () => ({ isFile: () => true, isSymbolicLink: () => false }),
+  readFile: () => rpc('readFile'),
+  unlink: () => rpc('unlink'),
+}
+const claim = new Function('fs', 'process', 'isRecord', 'isPidAlive', 'LOG_PREFIX', 'errorMessage',
+  process.env.LOCK_IMPLEMENTATION + '\\nreturn acquireLock')(controlledFs, process,
+    value => value !== null && typeof value === 'object', () => false,
+    '[graphify-init]', error => String(error))
+const acquired = await claim('/isolated/stale-lock')
+process.send({ type: 'done', acquired: Boolean(acquired) }, () => process.disconnect())
+`
+let exists = true
+let unlinks = 0
+const waitingReads = []
+let waitingSecondUnlink
+function respond(child, id, value, error) { child.send({ id, value, error }) }
+function handle(child, message) {
+  const { op, id } = message
+  if (op === 'open') return respond(child, id, null, 'EEXIST')
+  if (op === 'lstat') return respond(child, id, null)
+  if (op === 'readFile') {
+    waitingReads.push([child, id])
+    if (waitingReads.length === 2) {
+      for (const [reader, readId] of waitingReads) respond(reader, readId, '99999999\n')
+    }
+    return
+  }
+  if (op === 'unlink') {
+    unlinks++
+    if (unlinks === 2) waitingSecondUnlink = [child, id]
+    else { exists = false; respond(child, id, null) }
+    return
+  }
+  if (op === 'writeFile') {
+    if (exists) return respond(child, id, null, 'EEXIST')
+    exists = true
+    respond(child, id, null)
+    if (waitingSecondUnlink) {
+      exists = false
+      respond(waitingSecondUnlink[0], waitingSecondUnlink[1], null)
+    }
+  }
+}
+const claimants = Array.from({ length: 2 }, () => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', workerCode], {
+    env: { ...process.env, LOCK_IMPLEMENTATION: implementation },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  })
+  let stderr = ''
+  child.stderr.on('data', chunk => { stderr += String(chunk) })
+  child.on('message', message => {
+    if (message.type === 'op') handle(child, message)
+    if (message.type === 'done') resolve(message.acquired)
+  })
+  child.on('error', reject)
+  child.on('exit', code => { if (code !== 0) reject(new Error(`claimant exited ${code}: ${stderr}`)) })
+}))
+const results = await Promise.all(claimants)
+// Then neither independent process may claim the dead lock or replace a new owner.
+assert.deepEqual(results, [false, false])
+assert.equal(exists, true)
+console.log('PASS: two process-level stale claimants cannot replace an intervening live lock')
+JS
+}
+
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == stale ]]; then shouldDenyCompetingStaleLockClaimsAtReadBarrier; exit 0; fi
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == global ]]; then shouldRetainGlobalLockWhileOrphanedChildCanStillWrite; exit 0; fi
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == command ]]; then shouldRetainCommandLockWhenSignaledChildIgnoresTermination; exit 0; fi
+shouldDenyCompetingStaleLockClaimsAtReadBarrier
+shouldReleaseCommandLockOnlyAfterVerifiedSuccess
+shouldRetainCommandLockWhenSignaledChildIgnoresTermination
+shouldKeepPolicyUnversionedAfterInterruptedExtract
+shouldRejectUnsafeSymlinkedGeneratedArtifact
+shouldRebuildUnversionedEmptyMarkerWithoutLoop
+shouldRemoveOnlyOwnedGlobalContributionWhenLegacyCorpusBecomesEmpty
+shouldPreserveForeignContributionOnTagCollision
+shouldReconcilePendingGlobalAfterOptOut
+shouldRejectUnrecognizedVersionedModeAsPolicyProof
+shouldRebuildFreshUnversionedGraph
 shouldExposeBundledIndexCommandThroughOpenCodeConfig
 shouldKeepConfigResponsiveWhileBuildingInBackground
 shouldStaySilentWhenGraphMatchesHeadCommit
@@ -1723,8 +2201,8 @@ shouldAggregateHintWhenNestedRepositoriesHaveNoConsent
 shouldRefreshStaleGraphWithIncrementalExtract
 shouldReExtractWhenCommitLandsMidExtract
 shouldRefreshCodeOnlyDespiteAmbientDocsEnvironment
-shouldRefreshWithDocsBackendWhenModeFileRecordsDocs
-shouldDeriveDocsRefreshFromSemanticMarkerWhenModeFileIsAbsent
+shouldMigrateLegacyDocsBackendWhenModeFileRecordsDocs
+shouldMigrateLegacySemanticGraphWhenModeFileIsAbsent
 shouldRebuildWhenGraphFileIsUnreadable
 shouldKeepExistingGraphWhenRepositoryHasNoCommits
 shouldToastErrorWhenBuildFails
@@ -1739,22 +2217,23 @@ shouldTreatDocsCensusWithBackendErrorAsFailureNotEmptyCorpus
 shouldClearEmptyMarkerOnceRepositoryGainsCode
 shouldSummarizeAggregateWhenAllNestedRepositoriesAreEmpty
 shouldSummarizeAggregateFailuresWithIndexCommandHint
-shouldBuildDocsGraphWhenModeFileRequestsDocsWithBackend
-shouldBuildDocsGraphWithAutoDetectedBackendWhenUnpinned
-shouldMirrorDocsModeInRecoveryCommand
+shouldBuildCodeGraphWhenLegacyModeRequestsDocsWithBackend
+shouldBuildCodeGraphWhenLegacyDocsBackendIsUnpinned
+shouldUseCodeOnlyRecoveryForLegacyDocsFailure
 shouldRunByDefaultWithoutEnvironmentFlag
 shouldDoNothingWhenOptedOut
 shouldSkipGlobalRegistrationWhenOptedOut
 shouldRegisterEveryRepositoryInTheGlobalGraph
-shouldWarnWhenGlobalMergeFailsDespiteExitZero
 shouldExcludeGraphOutputFromLinkedWorktreeGitMetadata
 shouldAggregateNestedRepositoriesUnderPlainRoot
 shouldFallBackToSingleRootWhenPlainDirHasNoNestedRepos
 shouldSkipExtractWhileAnotherLiveSessionHoldsTheLock
-shouldReplaceStaleLockLeftByDeadSession
+shouldRetainStaleLockLeftByDeadSession
 shouldKeepLockWhileOrphanedExtractChildIsAlive
 shouldKillRunningExtractWhenServerIsTerminated
 shouldKillExtractThatExceedsItsTimeBudget
 shouldWarnWhenBinaryIsMissing
+shouldWarnWhenGlobalMergeFailsDespiteExitZero
+shouldRetainGlobalLockWhileOrphanedChildCanStillWrite
 
 echo "PASS: graphify-init consent, refresh, and notification contracts"

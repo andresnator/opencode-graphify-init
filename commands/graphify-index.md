@@ -1,43 +1,51 @@
 You are running `/graphify-index` with raw arguments:
 `$ARGUMENTS`
 
-Build the first Graphify code graph for one repository — or for every repository under an aggregator workspace folder — with the human deciding whether to index and in which mode. After this command succeeds, the `graphify-init` plugin refreshes the graph automatically and incrementally on later sessions; it never performs a first indexing on its own.
+Authorize the first **code-only** Graphify index for a repository or a confirmed set of repositories under a workspace. The plugin automatically rebuilds previously authorized unversioned indexes and refreshes later changes. Never offer documentation indexing or a backend selection. Source documents and code comments remain untouched.
 
-## Hard constraints
+## Boundaries
 
-- Use `graphify extract` only. Never run `graphify update` or `graphify watch`: both recreate `graphify-out/` at the repo root, outside `.ai/`.
-- Every `graphify` invocation (including probes) must carry the environment variable `GRAPHIFY_OUT=.ai/graphify-out`. Never use the `--out` flag: it does not combine with `GRAPHIFY_OUT` (you would get `.ai/.ai/graphify-out`) and the MCP server would stop finding the graph.
-- `.ai/` is a HIDDEN directory: default file globs skip dotfiles. When checking Graphify state, list or read explicit paths (`ls -la .ai/graphify-out`, `cat .ai/graphify-out/graph.json`) or search with hidden files enabled (`rg --hidden`). Never conclude state is missing based on a dot-skipping glob.
-- Refuse to index unsafe roots: the filesystem root, the home directory, or any ancestor of the home directory. Suggest opening a concrete project folder instead.
-- Ask questions in chat using plain conversational messages; do not assume a runtime-specific question tool is available.
+- Use only `GRAPHIFY_OUT=.ai/graphify-out graphify extract <root> --code-only`. Never run `graphify update` or `graphify watch`; never use `--out`, `--backend`, or inline `--global`.
+- Refuse the filesystem root, home directory, and ancestors of home. Refuse symlinked `.ai` or `.ai/graphify-out` state directories. Never delete an existing consent file or lock.
+- Hidden `.ai/` paths require explicit inspection; ordinary globs omit them.
+- Ask for consent in chat. Do not assume a question tool exists.
 
 ## Workflow
 
-1. **Resolve the target root.** Use the argument path if given, else the current project root. If the root contains a `.git` entry it is a single repository. Otherwise treat it as an aggregator workspace: discover git repositories nested up to 2 directory levels below it, skipping hidden directories, `node_modules`, and symlinked directories. List what you found and confirm the set with the human before doing anything.
-2. **Check preconditions.** Run `GRAPHIFY_OUT=.ai/graphify-out graphify --version`; if the binary is missing, stop and tell the human to install it (`uv tool install graphifyy` or `pipx install graphifyy`). For each target repo, check `.ai/graphify-out/graph.json`: if a healthy graph already exists, report it and skip that repo (the plugin keeps it fresh; re-indexing is only worth it if the human explicitly wants to change mode). When the human DOES want to change an existing repo's mode, direction matters:
-   - **docs → code-only**: an incremental `--code-only` extract deliberately preserves the old document/paper/image nodes (Graphify design), so the recorded mode would lie about the graph's contents. Purge first: run `graphify global remove <tag>` (skip when `OPENCODE_GRAPHIFY_GLOBAL=0` or the tag is not in `graphify global list`), delete the contents of `.ai/graphify-out/` (graph.json, manifest.json, `.graphify_semantic_marker`, `.opencode-index-mode`), then run the full extract below as if it were a first indexing.
-   - **code-only → docs**: no purge needed — the incremental semantic pass adds the document nodes on top of the unchanged code; just run the extract below with the docs flags.
-3. **Ask the indexing mode** (one question in chat, covering all target repos; offer per-repo overrides only if the human asks). If `OPENCODE_GRAPHIFY_DOCS=1` is exported, mention that the human's shell defaults to docs mode — but still ask; the environment never replaces the answer:
-   - **Code-only (recommended):** pure local AST extraction. Takes seconds to a couple of minutes even on large repos. No credentials, no cost.
-   - **Docs + code:** also routes documentation (Markdown, PDFs, images) through an LLM backend. Takes minutes (~8 minutes on a ~300-file repo) and spends real tokens (a reference run on this repo billed ~184k output tokens). Needs a configured backend: use `OPENCODE_GRAPHIFY_BACKEND` if set, otherwise ask which backend to pass to `--backend`.
-   - Either way, tell the human the first pass is the slow one: later refreshes are incremental (unchanged files are never re-parsed; unchanged docs are never re-billed) and the plugin runs them automatically.
-4. **Index each repo** (from that repo's root):
-   - Ensure the exclude entry: append `.ai/graphify-out` to the file returned by `git rev-parse --git-path info/exclude` (this covers linked worktrees) if the entry is not already present.
-   - State the expected duration for the chosen mode, then run the lock + mode file + extract as ONE shell invocation. This matters twice over: the mode file is the plugin's standing consent, so a second OpenCode session opened mid-extract would see consent plus no graph and start a duplicate (token-spending) extraction unless the same `.opencode-extract-lock` the plugin honors is already held — and the lock must be taken BEFORE the mode file is written and hold a PID that stays alive for the extract's whole duration, which is only true of the shell that runs the extract itself (each tool-run shell dies with its invocation):
+1. Resolve the argument or project root to its canonical path. For a root with `.git`, use that repository. Otherwise find Git repositories up to two directory levels below it, excluding hidden paths, `node_modules`, and symlinked directories. List the resulting repositories and confirm the set with the human.
+2. Probe `GRAPHIFY_OUT=.ai/graphify-out graphify --version`; if unavailable, stop and suggest `uv tool install graphifyy` or `pipx install graphifyy`.
+3. Inspect each `.ai/graphify-out/graph.json`, `.opencode-index-mode`, `.opencode-empty-corpus`, and `.opencode-extract-lock` explicitly. A versioned state `{"mode":"code-only","policyVersion":1}` records successful local reconstruction; a historical `mode` value alone does **not** prove a clean graph. For previously authorized repos, do not run a competing extract: the plugin cleans generated state under its exclusive lock, even when HEAD is fresh or an old empty marker exists. Existing locks, **including dead-PID locks**, are never reclaimed automatically. Follow the manual recovery preconditions in `docs/lifecycle.md` rather than retrying blindly. Do not remove or replace a global contribution manually; tag collisions can destroy unrelated data.
+4. For each repository with no prior authorization, ask whether to start local code-only indexing. The first pass is local and free; subsequent refreshes are incremental. Before indexing, add `.ai/graphify-out` to `git rev-parse --git-path info/exclude` if missing. Run the following *as one foreground shell invocation from that repository*. Check every command's result; on failure, report it and leave the unversioned consent file for a plugin retry. Do not overwrite a pre-existing lock or state directory, and never use an unlocked purge:
 
-     ```bash
-     mkdir -p .ai/graphify-out
-     lock=.ai/graphify-out/.opencode-extract-lock
-     if ! (set -o noclobber; echo $$ > "$lock") 2>/dev/null; then
-       while read -r pid; do
-         kill -0 "$pid" 2>/dev/null && { echo "another session (pid $pid) is already extracting; aborting" >&2; exit 1; }
-       done < "$lock"
-       rm -f "$lock" && echo $$ > "$lock"   # every recorded PID is dead: stale lock, take over
-     fi
-     trap 'rm -f "$lock"' EXIT
-     printf '%s\n' '<mode-json>' > .ai/graphify-out/.opencode-index-mode
-     GRAPHIFY_OUT=.ai/graphify-out graphify extract . [--code-only | --backend <backend>] --global --as <tag>
-     ```
+   ```bash
+   test ! -L .ai && { test ! -e .ai || test -d .ai; } || exit 1
+   mkdir -p .ai
+   test ! -L .ai/graphify-out && { test ! -e .ai/graphify-out || test -d .ai/graphify-out; } || exit 1
+   mkdir -p .ai/graphify-out
+   lock=.ai/graphify-out/.opencode-extract-lock
+   ( set -C; printf '%s\n' "$$" > "$lock" ) || { echo 'Index lock held or unsafe; stop for manual recovery' >&2; exit 1; }
+   child=
+   safe_release=0
+   on_interrupt() {
+     trap - HUP INT TERM
+     if test -n "$child"; then kill -TERM "$child" 2>/dev/null || :; fi
+     echo 'Interrupted: retaining lock until every extractor and descendant is quiescent' >&2
+     exit 1
+   }
+   on_exit() {
+     trap - EXIT
+     if test "$safe_release" = 1; then rm -f -- "$lock"; fi
+   }
+   trap on_interrupt HUP INT TERM
+   trap on_exit EXIT
+   printf '%s\n' '{"mode":"code-only"}' > .ai/graphify-out/.opencode-index-mode || exit 1
+   GRAPHIFY_OUT=.ai/graphify-out graphify extract . --code-only & child=$!
+   printf '%s\n%s\n' "$$" "$child" > "$lock" || exit 1
+   wait "$child" || exit 1
+   test -f .ai/graphify-out/graph.json || exit 1
+   printf '%s\n' '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}' > .ai/graphify-out/.opencode-index-mode || exit 1
+   safe_release=1
+   ```
 
-     where `<mode-json>` is one JSON line — `{"mode":"code-only"}` or `{"mode":"docs","backend":"<backend>"}` (omit `backend` if none was passed) — and `<tag>` is the repo directory basename with every character outside `[A-Za-z0-9_-]` replaced by `-`. Omit `--global --as <tag>` when `OPENCODE_GRAPHIFY_GLOBAL=0`. If the lock is held by a live PID, tell the human another session is indexing this repo and stop. Writing the mode file before the extract (but after the lock) means an interrupted first pass is resumed automatically (and incrementally) by the plugin next session; a killed shell leaves a dead-PID lock the plugin replaces on its own.
-5. **Report.** For each repo: node count from `graph.json`, elapsed time, and mode recorded. Remind the human that refreshes now happen automatically each session and stay in the chosen mode regardless of environment variables.
+   This recipe is for a direct, foreground Graphify CLI, not a daemonizing wrapper. An interrupted `wait`, a successful `kill` request, or a failed extract does **not** prove its process tree stopped: the EXIT handler deliberately retains the lock unless a normal exit-0 build and policy write completed. If the CLI can spawn untracked writers, stop and use the lifecycle guide's quiescence-based manual recovery; do not assume the direct PID covers descendants. If Graphify confirms `extraction produced no nodes`, it may exit nonzero without a graph: do **not** write a successful version marker manually. Keep consent; after verifying all affected processes have stopped, remove only the relevant lock according to `docs/lifecycle.md`, then reopen for the plugin's confirmed empty outcome. Never run the snippet if graph, mode file, or empty marker already exists. The plugin later reconciles global registration under its own lock and verifies manifest ownership first. `OPENCODE_GRAPHIFY_GLOBAL=0` leaves the shared store untouched and retains pending reconciliation until re-enabled.
+5. Report each outcome and node count from `graph.json`. An incomplete or interrupted first pass retains consent and its lock; only after quiescence-based manual recovery can the plugin retry. An unversioned historical graph is not safe to serve as code-only until reconstruction finishes. External Graphify processes do not honor plugin locks, so never promise universal cross-tool serialization.

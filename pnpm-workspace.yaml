@@ -16,8 +16,7 @@ allowBuilds:
   esbuild@0.28.1: true
   opencode-ai@1.18.13: true
   msgpackr-extract@3.0.4: false
-packageManagerStrict: true
-packageManagerStrictVersion: true
+pmOnFail: error
 verifyDepsBeforeRun: error
 engineStrict: true
 nodeVersion: 22.23.2
