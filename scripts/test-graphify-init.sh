@@ -1836,6 +1836,7 @@ shouldRejectUnrecognizedVersionedModeAsPolicyProof() {
   root=$(make_committed_repo false-policy-repo)
   plant_graph "$root" head
   printf '{"mode":"docs","policyVersion":1,"pendingGlobal":false}\n' >"$root/.ai/graphify-out/.opencode-index-mode"
+  hold_builds "$root"
 
   # When
   start_server false-policy 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
@@ -1843,6 +1844,11 @@ shouldRejectUnrecognizedVersionedModeAsPolicyProof() {
 
   # Then
   wait_for_pattern "extract|$root|" "$FAKE_LOG"
+  wait_for_file "$root/.fake-graphify/build-started"
+  # The extract log precedes graph export and the awaited global reconciliation.
+  assert_mode_file "$root" '{"mode":"docs","policyVersion":1,"pendingGlobal":false}'
+  release_builds "$root"
+  wait_for_pattern "Graphify graph for false-policy-repo is ready" "$EVENTS_FILE"
   assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
   cleanup_processes
 }
@@ -1895,9 +1901,113 @@ shouldPreserveForeignContributionOnTagCollision() {
 
   # Then
   wait_for_pattern "Graphify could not merge collision-repo" "$EVENTS_FILE"
+  ! grep -Fq 'Run: graphify global' "$EVENTS_FILE" || fail "foreign owner received unsafe global recovery command"
   [[ "$(cksum "$HOME_DIR/.graphify/global-manifest.json")" == "$prior" ]] || fail "collision overwrote foreign contribution"
   [[ $(count_global_add_calls "$root") -eq 0 ]] || fail "foreign tag was handed to global add"
   assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  cleanup_processes
+}
+
+shouldAvoidGlobalRecoveryCommandWhenManifestIsMalformed() {
+  # Given a malformed manifest, Graphify must not suggest a by-tag mutation.
+  local root
+  root=$(make_committed_repo malformed-global-repo)
+  plant_mode "$root" code-only
+  mkdir -p "$HOME_DIR/.graphify"
+  printf '{broken\n' >"$HOME_DIR/.graphify/global-manifest.json"
+  printf '{"nodes":[],"links":[]}\n' >"$HOME_DIR/.graphify/global-graph.json"
+
+  # When
+  start_server malformed-global 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/malformed-global.config.json"
+
+  # Then
+  wait_for_pattern "Graphify could not merge malformed-global-repo" "$EVENTS_FILE"
+  ! grep -Fq 'Run: graphify global' "$EVENTS_FILE" || fail "malformed manifest received unsafe global recovery command"
+  [[ $(count_global_add_calls "$root") -eq 0 ]] || fail "malformed manifest reached global add"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  cleanup_processes
+}
+
+shouldReportBookkeepingFailureAfterSuccessfulGlobalReconciliation() {
+  # Given an authorized pending retry whose final atomic mode-file write cannot start.
+  local root
+  root=$(make_committed_repo bookkeeping-fail-repo)
+  plant_graph "$root" head
+  printf '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}\n' >"$root/.ai/graphify-out/.opencode-index-mode"
+  HOME_DIR="$SUITE_DIR/home-bookkeeping-fail"
+  mkdir -p "$HOME_DIR"
+  start_server bookkeeping-fail 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  mkdir "$root/.ai/graphify-out/.opencode-index-mode.$SERVER_PID.tmp"
+
+  # When
+  request_config "$root" "$SUITE_DIR/bookkeeping-fail.config.json"
+
+  # Then: global CLI succeeded, but retry bookkeeping remains pending; no stale-global claim.
+  wait_for_pattern "Graphify completed global reconciliation for bookkeeping-fail-repo but could not save its local retry state" "$EVENTS_FILE"
+  ! grep -Fq "Graphify could not merge bookkeeping-fail-repo" "$EVENTS_FILE" || fail "successful global add was reported as stale"
+  [[ $(count_global_add_calls "$root") -eq 1 ]] || fail "global add did not succeed before mode write failure"
+  jq -e '.repos["bookkeeping-fail-repo"] != null' "$HOME_DIR/.graphify/global-manifest.json" >/dev/null || fail "successful global owner missing"
+  assert_mode_file "$root" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  cleanup_processes
+}
+
+shouldSummarizeCompletedAggregateReconciliation() {
+  # Given two previously indexed nested repositories waiting only for global registration.
+  local aggregate_root="$SUITE_DIR/repos/aggregate-reconcile-root"
+  local repo_a="$aggregate_root/gitlab/reconcile-a"
+  local repo_b="$aggregate_root/gitlab/reconcile-b"
+  HOME_DIR="$SUITE_DIR/home-aggregate-reconcile"
+  mkdir -p "$HOME_DIR" "$aggregate_root"
+  for repo in "$repo_a" "$repo_b"; do
+    mkdir -p "$repo"
+    git_init "$repo"
+    : >"$repo/tracked"
+    git -C "$repo" add tracked
+    git -C "$repo" commit -qm initial
+    plant_graph "$repo" head
+    printf '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}\n' >"$repo/.ai/graphify-out/.opencode-index-mode"
+  done
+
+  # When
+  start_server aggregate-reconcile 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$aggregate_root" "$SUITE_DIR/aggregate-reconcile.config.json"
+
+  # Then
+  wait_for_pattern "Graphify reconciled global registrations for 2 repositories under aggregate-reconcile-root" "$EVENTS_FILE"
+  assert_mode_file "$repo_a" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
+  assert_mode_file "$repo_b" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
+  [[ $(count_extract_calls "$aggregate_root") -eq 0 ]] || fail "reconciliation re-extracted graphs"
+  cleanup_processes
+}
+
+shouldSummarizeReconciledSubsetWhenAnotherRepositoryIsLocked() {
+  # Given one pending global reconciliation and one live-owned extraction lock.
+  local aggregate_root="$SUITE_DIR/repos/aggregate-mixed-root"
+  local reconciled="$aggregate_root/gitlab/reconcile-subset"
+  local locked="$aggregate_root/gitlab/locked-subset"
+  HOME_DIR="$SUITE_DIR/home-aggregate-mixed"
+  mkdir -p "$HOME_DIR"
+  for repo in "$reconciled" "$locked"; do
+    mkdir -p "$repo"
+    git_init "$repo"
+    : >"$repo/tracked"
+    git -C "$repo" add tracked
+    git -C "$repo" commit -qm initial
+    plant_graph "$repo" head
+    printf '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}\n' >"$repo/.ai/graphify-out/.opencode-index-mode"
+  done
+  printf '%s\n' "$$" >"$locked/.ai/graphify-out/.opencode-extract-lock"
+
+  # When
+  start_server aggregate-mixed 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$aggregate_root" "$SUITE_DIR/aggregate-mixed.config.json"
+
+  # Then: completed work is counted, but the locked repository is not claimed complete.
+  wait_for_pattern "Graphify reconciled global registrations for 1 repository under aggregate-mixed-root" "$EVENTS_FILE"
+  assert_mode_file "$reconciled" '{"mode":"code-only","policyVersion":1,"pendingGlobal":false}'
+  assert_mode_file "$locked" '{"mode":"code-only","policyVersion":1,"pendingGlobal":true}'
+  [[ $(count_global_add_calls "$locked") -eq 0 ]] || fail "locked repository was globally mutated"
   cleanup_processes
 }
 
@@ -2177,6 +2287,9 @@ console.log('PASS: two process-level stale claimants cannot replace an interveni
 JS
 }
 
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == bookkeeping ]]; then shouldReportBookkeepingFailureAfterSuccessfulGlobalReconciliation; exit 0; fi
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == aggregate-mixed ]]; then shouldSummarizeReconciledSubsetWhenAnotherRepositoryIsLocked; exit 0; fi
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == aggregate-reconcile ]]; then shouldSummarizeCompletedAggregateReconciliation; exit 0; fi
 if [[ "${GRAPHIFY_TEST_FOCUS:-}" == stale ]]; then shouldDenyCompetingStaleLockClaimsAtReadBarrier; exit 0; fi
 if [[ "${GRAPHIFY_TEST_FOCUS:-}" == global ]]; then shouldRetainGlobalLockWhileOrphanedChildCanStillWrite; exit 0; fi
 if [[ "${GRAPHIFY_TEST_FOCUS:-}" == command ]]; then shouldRetainCommandLockWhenSignaledChildIgnoresTermination; exit 0; fi
@@ -2188,6 +2301,10 @@ shouldRejectUnsafeSymlinkedGeneratedArtifact
 shouldRebuildUnversionedEmptyMarkerWithoutLoop
 shouldRemoveOnlyOwnedGlobalContributionWhenLegacyCorpusBecomesEmpty
 shouldPreserveForeignContributionOnTagCollision
+shouldAvoidGlobalRecoveryCommandWhenManifestIsMalformed
+shouldSummarizeCompletedAggregateReconciliation
+shouldSummarizeReconciledSubsetWhenAnotherRepositoryIsLocked
+shouldReportBookkeepingFailureAfterSuccessfulGlobalReconciliation
 shouldReconcilePendingGlobalAfterOptOut
 shouldRejectUnrecognizedVersionedModeAsPolicyProof
 shouldRebuildFreshUnversionedGraph

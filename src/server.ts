@@ -161,8 +161,16 @@ const aggregateEmptyMessage = (rootName: string) =>
 
 // The local graph IS ready in this case — only its cross-repository registration failed,
 // and Graphify exits 0 after that failure, so without this toast it would go unnoticed.
-const globalMergeWarningMessage = (repo: string, command: string) =>
-  `Graphify could not merge ${repo} into the global graph; cross-repository queries stay stale. Run: ${command}`
+const globalMergeWarningMessage = (repo: string, guidance: string) =>
+  `Graphify could not merge ${repo} into the global graph; cross-repository queries stay stale. ${guidance}`
+
+const globalRefusalGuidance = "Global ownership or lock could not be verified; inspect the global manifest and lock before retrying. No global mutation is safe to run yet."
+
+const globalBookkeepingWarningMessage = (repo: string) =>
+  `Graphify completed global reconciliation for ${repo} but could not save its local retry state; reconciliation may be repeated on the next session.`
+
+const aggregateReconciledMessage = (count: number, rootName: string) =>
+  `Graphify reconciled global registrations for ${repositoriesLabel(count)} under ${rootName}.`
 
 const missingBinaryMessage = () => `Graphify CLI was not found. Run: ${GRAPHIFY_INSTALL_HINT}`
 
@@ -613,21 +621,23 @@ function globalDirectory() {
   return path.join(process.env.HOME ?? "", ".graphify")
 }
 
-async function reconcileGlobal(root: string, empty: boolean) {
-  if (!isGlobalEnabled()) return false
+type GlobalResult = "success" | "refused" | "cli-failed"
+
+async function reconcileGlobal(root: string, empty: boolean): Promise<GlobalResult> {
+  if (!isGlobalEnabled()) return "refused"
   const home = process.env.HOME
-  if (!home || !path.isAbsolute(home)) return false
+  if (!home || !path.isAbsolute(home)) return "refused"
   const dir = globalDirectory()
   try {
     const stat = await fs.lstat(dir)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return false
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return "refused"
   } catch (error) {
-    if (!isRecord(error) || error.code !== "ENOENT") return false
-    try { await fs.mkdir(dir) } catch { return false }
+    if (!isRecord(error) || error.code !== "ENOENT") return "refused"
+    try { await fs.mkdir(dir) } catch { return "refused" }
   }
   const lockPath = path.join(dir, GLOBAL_LOCK)
   const lock = await acquireLock(lockPath)
-  if (!lock) return false
+  if (!lock) return "refused"
   let safeToRelease = true
   try {
     const manifestPath = path.join(dir, GLOBAL_MANIFEST)
@@ -639,28 +649,28 @@ async function reconcileGlobal(root: string, empty: boolean) {
       } catch (error) { return isRecord(error) && error.code === "ENOENT" ? "absent" : "unsafe" }
     }))
     if (existing.includes("unsafe") || (existing[0] === "absent" && existing[1] === "file") ||
-      (existing[0] === "file" && existing[1] === "absent")) return false
+      (existing[0] === "file" && existing[1] === "absent")) return "refused"
     let repos: Record<string, unknown> = {}
     if (existing[0] === "file") {
         const data: unknown = JSON.parse(await fs.readFile(manifestPath, "utf8"))
-      if (!isRecord(data) || !isRecord(data.repos)) return false
+      if (!isRecord(data) || !isRecord(data.repos)) return "refused"
       repos = data.repos
       const graph: unknown = JSON.parse(await fs.readFile(graphPath, "utf8"))
       if (!isRecord(graph) || !Array.isArray(graph.nodes) ||
-        !(Array.isArray(graph.links) || Array.isArray(graph.edges))) return false
+        !(Array.isArray(graph.links) || Array.isArray(graph.edges))) return "refused"
       // A malformed entry could conceal a conflicting owner: never pass it to the CLI.
-      if (Object.values(repos).some((entry) => !isRecord(entry) || typeof entry.source_path !== "string")) return false
+      if (Object.values(repos).some((entry) => !isRecord(entry) || typeof entry.source_path !== "string")) return "refused"
     }
     const tag = slugify(repoName(await realRoot(root)))
     const owner = repos[tag]
     const ownedPath = await fs.realpath(outDirPath(root))
     const expected = path.join(ownedPath, GRAPH_FILE)
-    if (owner && (!isRecord(owner) || owner.source_path !== expected)) return false
+    if (owner && (!isRecord(owner) || owner.source_path !== expected)) return "refused"
     if (!empty) {
       const stat = await fs.lstat(graphFilePath(root))
-      if (!stat.isFile() || stat.isSymbolicLink() || (await fs.realpath(graphFilePath(root))) !== expected) return false
+      if (!stat.isFile() || stat.isSymbolicLink() || (await fs.realpath(graphFilePath(root))) !== expected) return "refused"
     }
-    if (empty && !owner) return true
+    if (empty && !owner) return "success"
     const args = empty ? ["global", "remove", tag] : ["global", "add", expected, AS_FLAG, tag]
     let childPidRecorded: Promise<boolean> = Promise.resolve(false)
     const run = await runGraphify(args, root, {
@@ -670,12 +680,13 @@ async function reconcileGlobal(root: string, empty: boolean) {
       },
       timeoutMs: extractTimeoutMs(),
     })
-    if (!(await childPidRecorded) || run.error || run.exitCode !== 0 || GLOBAL_MERGE_WARNING_PATTERN.test(run.stderr)) return false
+    if (!(await childPidRecorded)) return "refused"
+    if (run.error || run.exitCode !== 0 || GLOBAL_MERGE_WARNING_PATTERN.test(run.stderr)) return "cli-failed"
     safeToRelease = true
-    return true
+    return "success"
   } catch (error) {
     console.error(`${LOG_PREFIX} global reconciliation refused: ${errorMessage(error)}`)
-    return false
+    return "refused"
   } finally {
     await releaseLock(lockPath, lock, safeToRelease)
   }
@@ -837,15 +848,16 @@ async function ensureGitExclude(root: string, artifactPath: string) {
 }
 
 type RepoOutcome =
-  | { kind: "reconciled"; globalRecovery?: string }
-  | { kind: "ready"; action: RepoAction; nodeCount: number | undefined; globalRecovery?: string }
-  | { kind: "empty"; globalRecovery?: string }
-  | { kind: "zero-nodes"; globalRecovery?: string }
+  | { kind: "reconciled" }
+  | { kind: "reconcile-failed"; globalWarning: string }
+  | { kind: "ready"; action: RepoAction; nodeCount: number | undefined; globalWarning?: string }
+  | { kind: "empty"; globalWarning?: string }
+  | { kind: "zero-nodes"; globalWarning?: string }
   | { kind: "locked" }
   | { kind: "action-failed"; action: RepoAction }
   | { kind: "incomplete"; action: RepoAction }
 
-// Manual recovery must first inspect the global manifest owner; this is a hint, not permission.
+// Only offer a manual command after ownership validation and an actual CLI failure.
 function recoveryGlobalCommand(root: string, tag: string, empty: boolean) {
   if (empty) return `${GRAPHIFY_BINARY} global remove ${quoteForDisplay(tag)}`
   const graphPath = path.join(root, OUT_RELATIVE, GRAPH_FILE)
@@ -876,15 +888,18 @@ async function buildRepoGraph(
     const args = [...EXTRACT_ARGS, root, CODE_ONLY_FLAG]
     await ensureGitExclude(root, outDirPath(root))
     const reconcile = async (empty: boolean) => {
-      const ok = await reconcileGlobal(root, empty)
-      const saved = ok && await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: false })
+      const result = await reconcileGlobal(root, empty)
+      const saved = result === "success" && await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: false })
       if (!saved && isGlobalEnabled()) console.error(`${LOG_PREFIX} global reconciliation pending for ${root}`)
-      return saved ? undefined : isGlobalEnabled() ? recoveryGlobalCommand(root, tag, empty) : undefined
+      if (saved || !isGlobalEnabled()) return undefined
+      if (result === "success") return globalBookkeepingWarningMessage(repoName(root))
+      const guidance = result === "cli-failed" ? `Run: ${recoveryGlobalCommand(root, tag, empty)}` : globalRefusalGuidance
+      return globalMergeWarningMessage(repoName(root), guidance)
     }
     if (current.kind === "reconcile") {
       const empty = (await readEmptyMarker(root)) !== undefined || (await readGraph(root))?.nodeCount === 0
-      const recovery = await reconcile(empty)
-      return { kind: "reconciled", globalRecovery: recovery }
+      const warning = await reconcile(empty)
+      return warning ? { kind: "reconcile-failed", globalWarning: warning } : { kind: "reconciled" }
     }
     await onStart(action)
     // Graphify stamps built_at_commit at EXPORT time, after scanning: a commit landing
@@ -911,7 +926,7 @@ async function buildRepoGraph(
           if (!(await writeEmptyMarker(root, headBefore))) return { kind: "action-failed", action }
           if (!(await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: true }))) return { kind: "action-failed", action }
           safeToRelease = true
-          return { kind: "empty", globalRecovery: await reconcile(true) }
+          return { kind: "empty", globalWarning: await reconcile(true) }
         }
         const detail = run.error ? errorMessage(run.error) : run.stderr.trim()
         if (detail) console.error(`${LOG_PREFIX} ${action} failed for ${root}: ${detail}`)
@@ -929,9 +944,9 @@ async function buildRepoGraph(
       if (!(await clearEmptyMarker(root))) return { kind: "action-failed", action }
       if (!(await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: true }))) return { kind: "action-failed", action }
       safeToRelease = true
-      const globalRecovery = await reconcile(graph.nodeCount === 0)
-      if (graph.nodeCount === 0) return { kind: "zero-nodes", globalRecovery }
-      return { kind: "ready", action, nodeCount: graph.nodeCount, globalRecovery }
+      const globalWarning = await reconcile(graph.nodeCount === 0)
+      if (graph.nodeCount === 0) return { kind: "zero-nodes", globalWarning }
+      return { kind: "ready", action, nodeCount: graph.nodeCount, globalWarning }
     }
   } finally {
     await releaseLock(lockFilePath(root), lock, safeToRelease)
@@ -948,21 +963,23 @@ async function presentSingleRoot(input: ToastInput, root: string, action: RepoAc
   }
 
   const outcome = await buildRepoGraph(root, action, onStart)
-  const warnGlobalMerge = async (recovery: string | undefined) => {
-    if (!recovery) return
-    await showToastBestEffort(input, globalMergeWarningMessage(repo, recovery), TOAST_VARIANTS.WARNING, WARNING_DURATION_MS)
+  const warnGlobal = async (warning: string | undefined) => {
+    if (!warning) return
+    await showToastBestEffort(input, warning, TOAST_VARIANTS.WARNING, WARNING_DURATION_MS)
   }
   switch (outcome.kind) {
     case "reconciled":
-      await warnGlobalMerge(outcome.globalRecovery)
+      return
+    case "reconcile-failed":
+      await warnGlobal(outcome.globalWarning)
       return
     case "empty":
       await showToastBestEffort(input, emptyCorpusMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS)
-      await warnGlobalMerge(outcome.globalRecovery)
+      await warnGlobal(outcome.globalWarning)
       return
     case "zero-nodes":
       await showToastBestEffort(input, zeroNodeMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS)
-      await warnGlobalMerge(outcome.globalRecovery)
+      await warnGlobal(outcome.globalWarning)
       return
     case "locked":
       // Another live session is already extracting this repository; it owns the toasts.
@@ -990,7 +1007,7 @@ async function presentSingleRoot(input: ToastInput, root: string, action: RepoAc
         TOAST_VARIANTS.SUCCESS,
         INFO_DURATION_MS,
       )
-      await warnGlobalMerge(outcome.globalRecovery)
+      await warnGlobal(outcome.globalWarning)
       return
   }
 }
@@ -1004,17 +1021,19 @@ async function presentAggregate(input: ToastInput, root: string, work: WorkItem[
   const failed: string[] = []
   let built = 0
   let locked = 0
+  let reconciled = 0
   for (const item of work) {
     // A nested repository with nothing to index is skipped, not counted as a failure.
     const outcome = await buildRepoGraph(item.root, item.action, async () => {})
     if (outcome.kind === "ready") built += 1
-    else if (outcome.kind === "locked" || outcome.kind === "reconciled") locked += 1
+    else if (outcome.kind === "locked") locked += 1
+    else if (outcome.kind === "reconciled") reconciled += 1
     else if (outcome.kind !== "empty" && outcome.kind !== "zero-nodes") failed.push(item.root)
     // A failed global merge exits 0, so it never lands in `failed`; it gets its own toast.
-    if ((outcome.kind === "ready" || outcome.kind === "zero-nodes" || outcome.kind === "empty" || outcome.kind === "reconciled") && outcome.globalRecovery) {
+    if ((outcome.kind === "ready" || outcome.kind === "zero-nodes" || outcome.kind === "empty" || outcome.kind === "reconcile-failed") && outcome.globalWarning) {
       await showToastBestEffort(
         input,
-        globalMergeWarningMessage(repoName(item.root), outcome.globalRecovery),
+        outcome.globalWarning,
         TOAST_VARIANTS.WARNING,
         WARNING_DURATION_MS,
       )
@@ -1024,6 +1043,10 @@ async function presentAggregate(input: ToastInput, root: string, work: WorkItem[
   if (failed.length === 0) {
     if (built === 0) {
       // Everything was locked by another session: that session owns the outcome toasts.
+      if (reconciled > 0) {
+        await showToastBestEffort(input, aggregateReconciledMessage(reconciled, rootName), TOAST_VARIANTS.SUCCESS, INFO_DURATION_MS)
+        return
+      }
       if (locked > 0) return
       // Every nested repository turned out empty: say so instead of leaving the start
       // toast dangling with no resolution.

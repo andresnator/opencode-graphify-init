@@ -68,7 +68,10 @@ var successMessage = (repo, nodeCount, elapsed) => nodeCount === void 0 ? `Graph
 var emptyCorpusMessage = (repo) => `Graphify found no indexable code in ${repo}; skipping the code graph.`;
 var zeroNodeMessage = (repo) => `Graphify found no indexable code left in ${repo}; the graph is now empty.`;
 var aggregateEmptyMessage = (rootName) => `Graphify found no indexable code in the repositories under ${rootName}; skipping the code graphs.`;
-var globalMergeWarningMessage = (repo, command) => `Graphify could not merge ${repo} into the global graph; cross-repository queries stay stale. Run: ${command}`;
+var globalMergeWarningMessage = (repo, guidance) => `Graphify could not merge ${repo} into the global graph; cross-repository queries stay stale. ${guidance}`;
+var globalRefusalGuidance = "Global ownership or lock could not be verified; inspect the global manifest and lock before retrying. No global mutation is safe to run yet.";
+var globalBookkeepingWarningMessage = (repo) => `Graphify completed global reconciliation for ${repo} but could not save its local retry state; reconciliation may be repeated on the next session.`;
+var aggregateReconciledMessage = (count, rootName) => `Graphify reconciled global registrations for ${repositoriesLabel(count)} under ${rootName}.`;
 var missingBinaryMessage = () => `Graphify CLI was not found. Run: ${GRAPHIFY_INSTALL_HINT}`;
 var incompleteMessage = (repo, command) => `Graphify graph for ${repo} is incomplete (${OUT_BASE}/${OUT_DIR}/${GRAPH_FILE} is missing or unreadable). Run: ${command}`;
 var processFailureMessage = (repo, command) => `Graphify indexing failed for ${repo}, but this session is still operational. Run: ${command}`;
@@ -427,24 +430,24 @@ function globalDirectory() {
   return path.join(process.env.HOME ?? "", ".graphify");
 }
 async function reconcileGlobal(root, empty) {
-  if (!isGlobalEnabled()) return false;
+  if (!isGlobalEnabled()) return "refused";
   const home = process.env.HOME;
-  if (!home || !path.isAbsolute(home)) return false;
+  if (!home || !path.isAbsolute(home)) return "refused";
   const dir = globalDirectory();
   try {
     const stat = await fs.lstat(dir);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return "refused";
   } catch (error) {
-    if (!isRecord(error) || error.code !== "ENOENT") return false;
+    if (!isRecord(error) || error.code !== "ENOENT") return "refused";
     try {
       await fs.mkdir(dir);
     } catch {
-      return false;
+      return "refused";
     }
   }
   const lockPath = path.join(dir, GLOBAL_LOCK);
   const lock = await acquireLock(lockPath);
-  if (!lock) return false;
+  if (!lock) return "refused";
   let safeToRelease = true;
   try {
     const manifestPath = path.join(dir, GLOBAL_MANIFEST);
@@ -457,26 +460,26 @@ async function reconcileGlobal(root, empty) {
         return isRecord(error) && error.code === "ENOENT" ? "absent" : "unsafe";
       }
     }));
-    if (existing.includes("unsafe") || existing[0] === "absent" && existing[1] === "file" || existing[0] === "file" && existing[1] === "absent") return false;
+    if (existing.includes("unsafe") || existing[0] === "absent" && existing[1] === "file" || existing[0] === "file" && existing[1] === "absent") return "refused";
     let repos = {};
     if (existing[0] === "file") {
       const data = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-      if (!isRecord(data) || !isRecord(data.repos)) return false;
+      if (!isRecord(data) || !isRecord(data.repos)) return "refused";
       repos = data.repos;
       const graph = JSON.parse(await fs.readFile(graphPath, "utf8"));
-      if (!isRecord(graph) || !Array.isArray(graph.nodes) || !(Array.isArray(graph.links) || Array.isArray(graph.edges))) return false;
-      if (Object.values(repos).some((entry) => !isRecord(entry) || typeof entry.source_path !== "string")) return false;
+      if (!isRecord(graph) || !Array.isArray(graph.nodes) || !(Array.isArray(graph.links) || Array.isArray(graph.edges))) return "refused";
+      if (Object.values(repos).some((entry) => !isRecord(entry) || typeof entry.source_path !== "string")) return "refused";
     }
     const tag = slugify(repoName(await realRoot(root)));
     const owner = repos[tag];
     const ownedPath = await fs.realpath(outDirPath(root));
     const expected = path.join(ownedPath, GRAPH_FILE);
-    if (owner && (!isRecord(owner) || owner.source_path !== expected)) return false;
+    if (owner && (!isRecord(owner) || owner.source_path !== expected)) return "refused";
     if (!empty) {
       const stat = await fs.lstat(graphFilePath(root));
-      if (!stat.isFile() || stat.isSymbolicLink() || await fs.realpath(graphFilePath(root)) !== expected) return false;
+      if (!stat.isFile() || stat.isSymbolicLink() || await fs.realpath(graphFilePath(root)) !== expected) return "refused";
     }
-    if (empty && !owner) return true;
+    if (empty && !owner) return "success";
     const args = empty ? ["global", "remove", tag] : ["global", "add", expected, AS_FLAG, tag];
     let childPidRecorded = Promise.resolve(false);
     const run = await runGraphify(args, root, {
@@ -486,12 +489,13 @@ async function reconcileGlobal(root, empty) {
       },
       timeoutMs: extractTimeoutMs()
     });
-    if (!await childPidRecorded || run.error || run.exitCode !== 0 || GLOBAL_MERGE_WARNING_PATTERN.test(run.stderr)) return false;
+    if (!await childPidRecorded) return "refused";
+    if (run.error || run.exitCode !== 0 || GLOBAL_MERGE_WARNING_PATTERN.test(run.stderr)) return "cli-failed";
     safeToRelease = true;
-    return true;
+    return "success";
   } catch (error) {
     console.error(`${LOG_PREFIX} global reconciliation refused: ${errorMessage(error)}`);
-    return false;
+    return "refused";
   } finally {
     await releaseLock(lockPath, lock, safeToRelease);
   }
@@ -637,15 +641,18 @@ async function buildRepoGraph(root, action, onStart) {
     const args = [...EXTRACT_ARGS, root, CODE_ONLY_FLAG];
     await ensureGitExclude(root, outDirPath(root));
     const reconcile = async (empty) => {
-      const ok = await reconcileGlobal(root, empty);
-      const saved = ok && await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: false });
+      const result = await reconcileGlobal(root, empty);
+      const saved = result === "success" && await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: false });
       if (!saved && isGlobalEnabled()) console.error(`${LOG_PREFIX} global reconciliation pending for ${root}`);
-      return saved ? void 0 : isGlobalEnabled() ? recoveryGlobalCommand(root, tag, empty) : void 0;
+      if (saved || !isGlobalEnabled()) return void 0;
+      if (result === "success") return globalBookkeepingWarningMessage(repoName(root));
+      const guidance = result === "cli-failed" ? `Run: ${recoveryGlobalCommand(root, tag, empty)}` : globalRefusalGuidance;
+      return globalMergeWarningMessage(repoName(root), guidance);
     };
     if (current.kind === "reconcile") {
       const empty = await readEmptyMarker(root) !== void 0 || (await readGraph(root))?.nodeCount === 0;
-      const recovery = await reconcile(empty);
-      return { kind: "reconciled", globalRecovery: recovery };
+      const warning = await reconcile(empty);
+      return warning ? { kind: "reconcile-failed", globalWarning: warning } : { kind: "reconciled" };
     }
     await onStart(action);
     for (let attempt = 0; ; attempt += 1) {
@@ -667,7 +674,7 @@ ${run.stderr}`)) {
           if (!await writeEmptyMarker(root, headBefore)) return { kind: "action-failed", action };
           if (!await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: true })) return { kind: "action-failed", action };
           safeToRelease = true;
-          return { kind: "empty", globalRecovery: await reconcile(true) };
+          return { kind: "empty", globalWarning: await reconcile(true) };
         }
         const detail = run.error ? errorMessage(run.error) : run.stderr.trim();
         if (detail) console.error(`${LOG_PREFIX} ${action} failed for ${root}: ${detail}`);
@@ -683,9 +690,9 @@ ${run.stderr}`)) {
       if (!await clearEmptyMarker(root)) return { kind: "action-failed", action };
       if (!await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: true })) return { kind: "action-failed", action };
       safeToRelease = true;
-      const globalRecovery = await reconcile(graph.nodeCount === 0);
-      if (graph.nodeCount === 0) return { kind: "zero-nodes", globalRecovery };
-      return { kind: "ready", action, nodeCount: graph.nodeCount, globalRecovery };
+      const globalWarning = await reconcile(graph.nodeCount === 0);
+      if (graph.nodeCount === 0) return { kind: "zero-nodes", globalWarning };
+      return { kind: "ready", action, nodeCount: graph.nodeCount, globalWarning };
     }
   } finally {
     await releaseLock(lockFilePath(root), lock, safeToRelease);
@@ -700,21 +707,23 @@ async function presentSingleRoot(input, root, action) {
     await showToastBestEffort(input, message, TOAST_VARIANTS.INFO, INFO_DURATION_MS);
   };
   const outcome = await buildRepoGraph(root, action, onStart);
-  const warnGlobalMerge = async (recovery) => {
-    if (!recovery) return;
-    await showToastBestEffort(input, globalMergeWarningMessage(repo, recovery), TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
+  const warnGlobal = async (warning) => {
+    if (!warning) return;
+    await showToastBestEffort(input, warning, TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
   };
   switch (outcome.kind) {
     case "reconciled":
-      await warnGlobalMerge(outcome.globalRecovery);
+      return;
+    case "reconcile-failed":
+      await warnGlobal(outcome.globalWarning);
       return;
     case "empty":
       await showToastBestEffort(input, emptyCorpusMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
-      await warnGlobalMerge(outcome.globalRecovery);
+      await warnGlobal(outcome.globalWarning);
       return;
     case "zero-nodes":
       await showToastBestEffort(input, zeroNodeMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
-      await warnGlobalMerge(outcome.globalRecovery);
+      await warnGlobal(outcome.globalWarning);
       return;
     case "locked":
       return;
@@ -741,7 +750,7 @@ async function presentSingleRoot(input, root, action) {
         TOAST_VARIANTS.SUCCESS,
         INFO_DURATION_MS
       );
-      await warnGlobalMerge(outcome.globalRecovery);
+      await warnGlobal(outcome.globalWarning);
       return;
   }
 }
@@ -752,16 +761,18 @@ async function presentAggregate(input, root, work) {
   const failed = [];
   let built = 0;
   let locked = 0;
+  let reconciled = 0;
   for (const item of work) {
     const outcome = await buildRepoGraph(item.root, item.action, async () => {
     });
     if (outcome.kind === "ready") built += 1;
-    else if (outcome.kind === "locked" || outcome.kind === "reconciled") locked += 1;
+    else if (outcome.kind === "locked") locked += 1;
+    else if (outcome.kind === "reconciled") reconciled += 1;
     else if (outcome.kind !== "empty" && outcome.kind !== "zero-nodes") failed.push(item.root);
-    if ((outcome.kind === "ready" || outcome.kind === "zero-nodes" || outcome.kind === "empty" || outcome.kind === "reconciled") && outcome.globalRecovery) {
+    if ((outcome.kind === "ready" || outcome.kind === "zero-nodes" || outcome.kind === "empty" || outcome.kind === "reconcile-failed") && outcome.globalWarning) {
       await showToastBestEffort(
         input,
-        globalMergeWarningMessage(repoName(item.root), outcome.globalRecovery),
+        outcome.globalWarning,
         TOAST_VARIANTS.WARNING,
         WARNING_DURATION_MS
       );
@@ -769,6 +780,10 @@ async function presentAggregate(input, root, work) {
   }
   if (failed.length === 0) {
     if (built === 0) {
+      if (reconciled > 0) {
+        await showToastBestEffort(input, aggregateReconciledMessage(reconciled, rootName), TOAST_VARIANTS.SUCCESS, INFO_DURATION_MS);
+        return;
+      }
       if (locked > 0) return;
       await showToastBestEffort(input, aggregateEmptyMessage(rootName), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
       return;
