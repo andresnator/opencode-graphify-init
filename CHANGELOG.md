@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.7](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.6...v0.1.7) (2026-09-23)
+
+
+### Features
+
+* switch authorized indexes to code-only extraction ([32edbca](https://github.com/andresnator/opencode-graphify-init/commit/32edbca3403ea05faf2790d1cc59db938db99424))
+* Trigger notification ([#28](https://github.com/andresnator/opencode-graphify-init/issues/28)) ([88fbd5b](https://github.com/andresnator/opencode-graphify-init/commit/88fbd5b1f74c89925c49987984f257fd76624425))
+
 ## [0.1.6](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.5...v0.1.6) (2026-08-31)
 
 
