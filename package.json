@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-graphify-init",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "packageManager": "pnpm@12.5.1",
   "description": "Consent-aware OpenCode plugin that refreshes Graphify graphs in the background.",
   "license": "MIT",
@@ -43,7 +43,7 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.13",
-    "@types/node": "24.13.3",
+    "@types/node": "26.2.0",
     "esbuild": "0.28.1",
     "opencode-ai": "1.18.13",
     "typescript": "5.9.3"
