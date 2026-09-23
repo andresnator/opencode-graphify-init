@@ -25,7 +25,9 @@ function shouldUsePinnedToolingAndTheReleaseTag() {
   assert.ok(workflow.includes("ref: ${{ github.event.release.tag_name }}"))
   assert.ok(workflow.includes("persist-credentials: false"))
   assert.ok(workflow.includes("node-version: 22.23.2"))
-  assert.ok(workflow.includes("version: 10.34.5"))
+  assert.equal(packageJson.packageManager, "pnpm@12.5.1")
+  const setupVersions = [...workflow.matchAll(/^\s+version: (\S+)\s*$/gm)].map((match) => match[1])
+  assert.deepEqual(setupVersions, ["12.5.1"])
   assert.ok(workflow.includes("npm install --global npm@12.0.2"))
 }
 

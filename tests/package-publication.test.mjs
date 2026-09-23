@@ -113,6 +113,21 @@ function shouldContainOnlyTheExpectedFilesWhenPackageIsPacked() {
   assert.deepEqual(actual, expected)
 }
 
+async function shouldPublishCodeOnlyLifecycleGuidanceWhenPacked() {
+  // Given the package ships the public lifecycle and command documents.
+  const command = await readFile(new URL("commands/graphify-index.md", ROOT), "utf8")
+  const lifecycle = await readFile(new URL("docs/lifecycle.md", ROOT), "utf8")
+
+  // When
+  const publishedGuidance = `${command}\n${lifecycle}`
+
+  // Then
+  assert.match(publishedGuidance, /--code-only/)
+  assert.match(publishedGuidance, /pendingGlobal/)
+  assert.doesNotMatch(publishedGuidance, /OPENCODE_GRAPHIFY_DOCS|OPENCODE_GRAPHIFY_BACKEND/)
+}
+
 shouldExposeBothServerEntrypointsWhenPackageIsPublished()
 shouldContainOnlyTheExpectedFilesWhenPackageIsPacked()
-process.stdout.write("PASS: 2 npm publication contracts.\n")
+await shouldPublishCodeOnlyLifecycleGuidanceWhenPacked()
+process.stdout.write("PASS: 3 npm publication contracts.\n")

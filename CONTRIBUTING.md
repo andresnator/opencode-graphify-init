@@ -1,6 +1,6 @@
 # Contributing
 
-Use Node.js `22.23.2`, pnpm `10.34.5`, OpenCode `1.18.13`, and Graphify `0.9.32`.
+Use Node.js `22.23.2`, pnpm `12.5.1`, OpenCode `1.18.13`, and Graphify `0.9.32`.
 
 ## Quick path
 
@@ -28,7 +28,8 @@ Keep the checkout at that path, restart OpenCode, and verify `/graphify-index` p
 
 - Never start first indexing without `/graphify-index` consent.
 - Keep refresh work non-blocking, bounded, recoverable, and scoped to `.ai/graphify-out/`.
-- Preserve the recorded code-only or docs mode.
+- Extract only code; preserve consent and reconstruct every unversioned authorized graph once under the successful code-only policy.
+- Validate global tag ownership before add/remove, and retain pending reconciliation after opt-out or failure.
 - Keep runtime npm dependencies at zero.
 - Add observable behavior contracts to the relevant test suite.
 - Keep public documentation in English.

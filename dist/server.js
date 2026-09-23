@@ -9,7 +9,6 @@ var GRAPHIFY_INSTALL_HINT = "uv tool install graphifyy (or pipx install graphify
 var GIT_BINARY = "git";
 var AUTOINIT_ENV = "OPENCODE_GRAPHIFY_AUTOINIT";
 var GLOBAL_ENV = "OPENCODE_GRAPHIFY_GLOBAL";
-var BACKEND_ENV = "OPENCODE_GRAPHIFY_BACKEND";
 var AUTOINIT_OPT_OUT = "0";
 var GLOBAL_OPT_OUT = "0";
 var OUT_BASE = ".ai";
@@ -20,20 +19,21 @@ var GRAPH_FILE = "graph.json";
 var EMPTY_MARKER_FILE = ".opencode-empty-corpus";
 var MODE_FILE = ".opencode-index-mode";
 var MODE_CODE_ONLY = "code-only";
-var MODE_DOCS = "docs";
-var SEMANTIC_MARKER_FILE = ".graphify_semantic_marker";
+var POLICY_VERSION = 1;
+var GENERATED_ARTIFACTS = ["graph.json", "manifest.json", ".graphify_root", ".graphify_semantic_marker", ".opencode-empty-corpus", "cache"];
+var GLOBAL_MANIFEST = "global-manifest.json";
+var GLOBAL_GRAPH = "global-graph.json";
+var GLOBAL_LOCK = ".opencode-global-lock";
 var LOCK_FILE = ".opencode-extract-lock";
 var INDEX_COMMAND = "/graphify-index";
 var INDEX_COMMAND_NAME = "graphify-index";
-var INDEX_COMMAND_DESCRIPTION = "First-time Graphify indexing with explicit human consent: choose code-only or docs mode and record that decision for automatic refreshes.";
+var INDEX_COMMAND_DESCRIPTION = "First-time code-only Graphify indexing with explicit human consent and automatic refreshes.";
 var INDEX_COMMAND_FILE = new URL("../commands/graphify-index.md", import.meta.url);
 var EMPTY_MARKER_NO_COMMIT = "none";
 var EMPTY_CORPUS_PATTERN = /produced no nodes/i;
 var GLOBAL_MERGE_WARNING_PATTERN = /\[graphify global\] warning/i;
 var EXTRACT_ARGS = ["extract"];
 var CODE_ONLY_FLAG = "--code-only";
-var BACKEND_FLAG = "--backend";
-var GLOBAL_FLAG = "--global";
 var AS_FLAG = "--as";
 var VERSION_ARGS = ["--version"];
 var GIT_EXCLUDE_ARGS = ["rev-parse", "--is-inside-work-tree", "--git-path", "info/exclude"];
@@ -68,11 +68,14 @@ var successMessage = (repo, nodeCount, elapsed) => nodeCount === void 0 ? `Graph
 var emptyCorpusMessage = (repo) => `Graphify found no indexable code in ${repo}; skipping the code graph.`;
 var zeroNodeMessage = (repo) => `Graphify found no indexable code left in ${repo}; the graph is now empty.`;
 var aggregateEmptyMessage = (rootName) => `Graphify found no indexable code in the repositories under ${rootName}; skipping the code graphs.`;
-var globalMergeWarningMessage = (repo, command) => `Graphify could not merge ${repo} into the global graph; cross-repository queries stay stale. Run: ${command}`;
+var globalMergeWarningMessage = (repo, guidance) => `Graphify could not merge ${repo} into the global graph; cross-repository queries stay stale. ${guidance}`;
+var globalRefusalGuidance = "Global ownership or lock could not be verified; inspect the global manifest and lock before retrying. No global mutation is safe to run yet.";
+var globalBookkeepingWarningMessage = (repo) => `Graphify completed global reconciliation for ${repo} but could not save its local retry state; reconciliation may be repeated on the next session.`;
+var aggregateReconciledMessage = (count, rootName) => `Graphify reconciled global registrations for ${repositoriesLabel(count)} under ${rootName}.`;
 var missingBinaryMessage = () => `Graphify CLI was not found. Run: ${GRAPHIFY_INSTALL_HINT}`;
 var incompleteMessage = (repo, command) => `Graphify graph for ${repo} is incomplete (${OUT_BASE}/${OUT_DIR}/${GRAPH_FILE} is missing or unreadable). Run: ${command}`;
 var processFailureMessage = (repo, command) => `Graphify indexing failed for ${repo}, but this session is still operational. Run: ${command}`;
-var noGraphMessage = (repo) => `No Graphify graph exists for ${repo} yet. Run ${INDEX_COMMAND} to build one: code-only takes seconds; docs mode takes minutes and spends LLM tokens. Refreshes after that are incremental and automatic.`;
+var noGraphMessage = (repo) => `No Graphify graph exists for ${repo} yet. Run ${INDEX_COMMAND} to authorize code-only indexing. Refreshes after that are incremental and automatic.`;
 var repositoriesLabel = (count) => `${count} ${count === 1 ? "repository" : "repositories"}`;
 var aggregateNoGraphMessage = (count, rootName) => `${repositoriesLabel(count)} under ${rootName} ${count === 1 ? "has" : "have"} no Graphify graph yet. Run ${INDEX_COMMAND} from ${rootName} to build them; refreshes after that are incremental and automatic.`;
 var aggregateStartMessage = (count, rootName) => `Graphify is building code graphs for ${repositoriesLabel(count)} under ${rootName} in the background. You can keep working.`;
@@ -97,8 +100,8 @@ function quoteForDisplay(value) {
 function outEnvPrefix() {
   return `${GRAPHIFY_OUT_ENV}=${OUT_RELATIVE}`;
 }
-function recoveryBuildCommand(root, mode) {
-  return [outEnvPrefix(), GRAPHIFY_BINARY, EXTRACT_ARGS[0], quoteForDisplay(root), ...modeArgs(mode)].join(" ");
+function recoveryBuildCommand(root) {
+  return [outEnvPrefix(), GRAPHIFY_BINARY, EXTRACT_ARGS[0], quoteForDisplay(root), CODE_ONLY_FLAG].join(" ");
 }
 function formatElapsed(elapsedMs) {
   return `${Math.max(0.1, elapsedMs / 1e3).toFixed(1)}s`;
@@ -269,124 +272,245 @@ async function readEmptyMarker(root) {
 }
 async function writeEmptyMarker(root, commit) {
   try {
-    await fs.mkdir(outDirPath(root), { recursive: true });
     await fs.writeFile(emptyMarkerPath(root), `${commit ?? EMPTY_MARKER_NO_COMMIT}
 `);
+    return true;
   } catch (error) {
     console.error(`${LOG_PREFIX} cannot record empty-corpus marker for ${root}: ${errorMessage(error)}`);
+    return false;
   }
 }
 async function clearEmptyMarker(root) {
   try {
-    await fs.rm(emptyMarkerPath(root), { force: true });
+    await fs.unlink(emptyMarkerPath(root));
+    return true;
   } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return true;
     console.error(`${LOG_PREFIX} cannot clear empty-corpus marker for ${root}: ${errorMessage(error)}`);
+    return false;
   }
 }
 function modeFilePath(root) {
   return path.join(outDirPath(root), MODE_FILE);
 }
-async function readIndexMode(root) {
+async function readIndexState(root) {
   try {
     const payload = JSON.parse(await fs.readFile(modeFilePath(root), "utf8"));
-    if (!isRecord(payload)) return void 0;
-    if (payload.mode === MODE_CODE_ONLY) return { mode: MODE_CODE_ONLY };
-    if (payload.mode === MODE_DOCS) {
-      const backend = typeof payload.backend === "string" ? payload.backend.trim() : "";
-      return backend ? { mode: MODE_DOCS, backend } : { mode: MODE_DOCS };
-    }
-    return void 0;
+    if (!isRecord(payload) || payload.mode !== MODE_CODE_ONLY && payload.mode !== "docs") return void 0;
+    return {
+      mode: MODE_CODE_ONLY,
+      policyVersion: payload.mode === MODE_CODE_ONLY && payload.policyVersion === POLICY_VERSION ? POLICY_VERSION : void 0,
+      pendingGlobal: payload.pendingGlobal === true
+    };
   } catch {
     return void 0;
   }
 }
-async function fallbackIndexMode(root) {
+async function persistIndexState(root, state) {
+  const target = modeFilePath(root);
+  const temporary = `${target}.${process.pid}.tmp`;
   try {
-    await fs.stat(path.join(outDirPath(root), SEMANTIC_MARKER_FILE));
-    const backend = process.env[BACKEND_ENV]?.trim();
-    return backend ? { mode: MODE_DOCS, backend } : { mode: MODE_DOCS };
-  } catch {
-    return { mode: MODE_CODE_ONLY };
-  }
-}
-async function persistIndexMode(root, mode) {
-  try {
-    await fs.mkdir(outDirPath(root), { recursive: true });
-    const payload = mode.backend ? { mode: mode.mode, backend: mode.backend } : { mode: mode.mode };
-    await fs.writeFile(modeFilePath(root), `${JSON.stringify(payload)}
-`);
+    await fs.writeFile(temporary, `${JSON.stringify(state)}
+`, { flag: "wx" });
+    await fs.rename(temporary, target);
+    return true;
   } catch (error) {
-    console.error(`${LOG_PREFIX} cannot record index mode for ${root}: ${errorMessage(error)}`);
+    console.error(`${LOG_PREFIX} cannot record indexing policy for ${root}: ${errorMessage(error)}`);
+    await fs.rm(temporary, { force: true }).catch(() => {
+    });
+    return false;
   }
-}
-function modeArgs(mode) {
-  if (mode.mode !== MODE_DOCS) return [CODE_ONLY_FLAG];
-  return mode.backend ? [BACKEND_FLAG, mode.backend] : [];
 }
 function lockFilePath(root) {
   return path.join(outDirPath(root), LOCK_FILE);
 }
-function isPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return isRecord(error) && error.code === "EPERM";
-  }
-}
-async function acquireExtractLock(root) {
-  const lockPath = lockFilePath(root);
-  try {
-    await fs.mkdir(outDirPath(root), { recursive: true });
-  } catch {
-    return true;
-  }
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+async function safeStateDirectory(root) {
+  for (const dir of [outBasePath(root), outDirPath(root)]) {
     try {
-      await fs.writeFile(lockPath, `${process.pid}
-`, { flag: "wx" });
-      return true;
+      const stat = await fs.lstat(dir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
     } catch (error) {
-      if (!isRecord(error) || error.code !== "EEXIST") return true;
-      const pids = (await fs.readFile(lockPath, "utf8").catch(() => "")).split(/\s+/).map((value) => Number.parseInt(value, 10)).filter((value) => Number.isFinite(value));
-      const livePid = pids.find(isPidAlive);
-      if (livePid !== void 0) {
-        console.error(`${LOG_PREFIX} another session (pid ${livePid}) is already extracting ${root}; skipping`);
+      if (!isRecord(error) || error.code !== "ENOENT") return false;
+      try {
+        await fs.mkdir(dir);
+      } catch {
         return false;
       }
-      await fs.rm(lockPath, { force: true }).catch(() => {
-      });
     }
   }
   return true;
 }
-async function recordLockChildPid(root, childPid) {
-  if (childPid === void 0) return;
+async function acquireLock(lockPath) {
   try {
-    await fs.writeFile(lockFilePath(root), `${process.pid}
+    const handle = await fs.open(lockPath, "wx", 384);
+    try {
+      await handle.writeFile(`${process.pid}
+`);
+      return handle;
+    } catch (error) {
+      await handle.close();
+      console.error(`${LOG_PREFIX} cannot initialize lock ${lockPath}: ${errorMessage(error)}`);
+      return void 0;
+    }
+  } catch (error) {
+    if (isRecord(error) && error.code === "EEXIST") {
+      console.error(`${LOG_PREFIX} lock already exists at ${lockPath}; refusing automatic takeover`);
+    } else console.error(`${LOG_PREFIX} cannot acquire lock ${lockPath}: ${errorMessage(error)}`);
+    return void 0;
+  }
+}
+async function acquireExtractLock(root) {
+  if (!await safeStateDirectory(root)) return void 0;
+  return acquireLock(lockFilePath(root));
+}
+async function recordLockChildPid(lock, childPid) {
+  if (childPid === void 0) return false;
+  try {
+    const bytes = Buffer.from(`${process.pid}
 ${childPid}
 `);
+    const result = await lock.write(bytes, 0, bytes.length, 0);
+    if (result.bytesWritten !== bytes.length) return false;
+    await lock.truncate(bytes.length);
+    return true;
   } catch (error) {
-    console.error(`${LOG_PREFIX} cannot record extract child pid: ${errorMessage(error)}`);
+    console.error(`${LOG_PREFIX} cannot record CLI child PID: ${errorMessage(error)}`);
+    return false;
   }
 }
-async function releaseExtractLock(root) {
-  await fs.rm(lockFilePath(root), { force: true }).catch(() => {
-  });
+async function releaseLock(lockPath, lock, safeToRelease) {
+  try {
+    if (!safeToRelease) return;
+    const [held, current] = await Promise.all([lock.stat(), fs.lstat(lockPath)]);
+    if (current.isFile() && !current.isSymbolicLink() && held.dev === current.dev && held.ino === current.ino) {
+      await fs.unlink(lockPath);
+    } else console.error(`${LOG_PREFIX} lock owner changed at ${lockPath}; retaining it`);
+  } catch (error) {
+    console.error(`${LOG_PREFIX} cannot release lock ${lockPath}: ${errorMessage(error)}`);
+  } finally {
+    await lock.close().catch(() => {
+    });
+  }
+}
+async function cleanGeneratedArtifacts(root) {
+  const directory = outDirPath(root);
+  for (const name of GENERATED_ARTIFACTS) {
+    try {
+      const stat = await fs.lstat(path.join(directory, name));
+      if (stat.isSymbolicLink() || (name === "cache" ? !stat.isDirectory() : !stat.isFile())) return false;
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "ENOENT") return false;
+    }
+  }
+  for (const name of GENERATED_ARTIFACTS) {
+    const target = path.join(directory, name);
+    if (name === "cache") {
+      const scan = async (dir) => {
+        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+          if (entry.isSymbolicLink()) return false;
+          if (entry.isDirectory() && !await scan(path.join(dir, entry.name))) return false;
+        }
+        return true;
+      };
+      try {
+        if (!await scan(target)) return false;
+      } catch (error) {
+        if (!isRecord(error) || error.code !== "ENOENT") return false;
+      }
+    }
+    try {
+      await fs.rm(target, { recursive: name === "cache", force: true });
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+function globalDirectory() {
+  return path.join(process.env.HOME ?? "", ".graphify");
+}
+async function reconcileGlobal(root, empty) {
+  if (!isGlobalEnabled()) return "refused";
+  const home = process.env.HOME;
+  if (!home || !path.isAbsolute(home)) return "refused";
+  const dir = globalDirectory();
+  try {
+    const stat = await fs.lstat(dir);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return "refused";
+  } catch (error) {
+    if (!isRecord(error) || error.code !== "ENOENT") return "refused";
+    try {
+      await fs.mkdir(dir);
+    } catch {
+      return "refused";
+    }
+  }
+  const lockPath = path.join(dir, GLOBAL_LOCK);
+  const lock = await acquireLock(lockPath);
+  if (!lock) return "refused";
+  let safeToRelease = true;
+  try {
+    const manifestPath = path.join(dir, GLOBAL_MANIFEST);
+    const graphPath = path.join(dir, GLOBAL_GRAPH);
+    const existing = await Promise.all([manifestPath, graphPath].map(async (file) => {
+      try {
+        const stat = await fs.lstat(file);
+        return stat.isFile() && !stat.isSymbolicLink() ? "file" : "unsafe";
+      } catch (error) {
+        return isRecord(error) && error.code === "ENOENT" ? "absent" : "unsafe";
+      }
+    }));
+    if (existing.includes("unsafe") || existing[0] === "absent" && existing[1] === "file" || existing[0] === "file" && existing[1] === "absent") return "refused";
+    let repos = {};
+    if (existing[0] === "file") {
+      const data = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+      if (!isRecord(data) || !isRecord(data.repos)) return "refused";
+      repos = data.repos;
+      const graph = JSON.parse(await fs.readFile(graphPath, "utf8"));
+      if (!isRecord(graph) || !Array.isArray(graph.nodes) || !(Array.isArray(graph.links) || Array.isArray(graph.edges))) return "refused";
+      if (Object.values(repos).some((entry) => !isRecord(entry) || typeof entry.source_path !== "string")) return "refused";
+    }
+    const tag = slugify(repoName(await realRoot(root)));
+    const owner = repos[tag];
+    const ownedPath = await fs.realpath(outDirPath(root));
+    const expected = path.join(ownedPath, GRAPH_FILE);
+    if (owner && (!isRecord(owner) || owner.source_path !== expected)) return "refused";
+    if (!empty) {
+      const stat = await fs.lstat(graphFilePath(root));
+      if (!stat.isFile() || stat.isSymbolicLink() || await fs.realpath(graphFilePath(root)) !== expected) return "refused";
+    }
+    if (empty && !owner) return "success";
+    const args = empty ? ["global", "remove", tag] : ["global", "add", expected, AS_FLAG, tag];
+    let childPidRecorded = Promise.resolve(false);
+    const run = await runGraphify(args, root, {
+      onSpawn: (child) => {
+        safeToRelease = false;
+        childPidRecorded = recordLockChildPid(lock, child.pid);
+      },
+      timeoutMs: extractTimeoutMs()
+    });
+    if (!await childPidRecorded) return "refused";
+    if (run.error || run.exitCode !== 0 || GLOBAL_MERGE_WARNING_PATTERN.test(run.stderr)) return "cli-failed";
+    safeToRelease = true;
+    return "success";
+  } catch (error) {
+    console.error(`${LOG_PREFIX} global reconciliation refused: ${errorMessage(error)}`);
+    return "refused";
+  } finally {
+    await releaseLock(lockPath, lock, safeToRelease);
+  }
 }
 async function planRepo(root) {
-  const emptyAtCommit = await readEmptyMarker(root);
-  if (emptyAtCommit && emptyAtCommit === (await gitValue(root, GIT_HEAD_ARGS) ?? EMPTY_MARKER_NO_COMMIT)) {
-    return { kind: "none" };
-  }
+  const state = await readIndexState(root);
   const graph = await readGraph(root);
-  if (graph) {
-    if (!await isGraphStale(root, graph)) return { kind: "none" };
-    return { kind: "update", mode: await readIndexMode(root) ?? await fallbackIndexMode(root) };
+  const emptyAtCommit = await readEmptyMarker(root);
+  if (!state && !graph && !emptyAtCommit) return { kind: "needs-consent" };
+  if (state?.policyVersion !== POLICY_VERSION) return { kind: "build" };
+  const head = await gitValue(root, GIT_HEAD_ARGS) ?? EMPTY_MARKER_NO_COMMIT;
+  if (emptyAtCommit === head || graph && !await isGraphStale(root, graph)) {
+    return state.pendingGlobal && isGlobalEnabled() ? { kind: "reconcile" } : { kind: "none" };
   }
-  const mode = await readIndexMode(root);
-  if (mode) return { kind: "build", mode };
-  return { kind: "needs-consent" };
+  return { kind: graph ? "update" : "build" };
 }
 async function realRoot(dir) {
   try {
@@ -495,32 +619,62 @@ ${entry}
     console.error(`${LOG_PREFIX} cannot update Git exclude file: ${errorMessage(error)}`);
   }
 }
-function recoveryGlobalAddCommand(root, tag) {
+function recoveryGlobalCommand(root, tag, empty) {
+  if (empty) return `${GRAPHIFY_BINARY} global remove ${quoteForDisplay(tag)}`;
   const graphPath = path.join(root, OUT_RELATIVE, GRAPH_FILE);
   return [GRAPHIFY_BINARY, "global", "add", quoteForDisplay(graphPath), AS_FLAG, tag].join(" ");
 }
-async function buildRepoGraph(root, action, mode, onStart) {
-  if (!await acquireExtractLock(root)) return { kind: "locked" };
+async function buildRepoGraph(root, action, onStart) {
+  const lock = await acquireExtractLock(root);
+  if (!lock) return { kind: "locked" };
+  let safeToRelease = true;
   try {
+    const current = await planRepo(root);
+    if (current.kind === "none" || current.kind === "needs-consent") return { kind: "locked" };
     const tag = slugify(repoName(await realRoot(root)));
-    const args = [...EXTRACT_ARGS, root, ...modeArgs(mode), ...isGlobalEnabled() ? [GLOBAL_FLAG, AS_FLAG, tag] : []];
+    const state = await readIndexState(root);
+    const migrate = state?.policyVersion !== POLICY_VERSION;
+    if (migrate && !await cleanGeneratedArtifacts(root)) {
+      console.error(`${LOG_PREFIX} unsafe generated artifacts; refusing migration for ${root}`);
+      return { kind: "action-failed", action };
+    }
+    const args = [...EXTRACT_ARGS, root, CODE_ONLY_FLAG];
     await ensureGitExclude(root, outDirPath(root));
+    const reconcile = async (empty) => {
+      const result = await reconcileGlobal(root, empty);
+      const saved = result === "success" && await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: false });
+      if (!saved && isGlobalEnabled()) console.error(`${LOG_PREFIX} global reconciliation pending for ${root}`);
+      if (saved || !isGlobalEnabled()) return void 0;
+      if (result === "success") return globalBookkeepingWarningMessage(repoName(root));
+      const guidance = result === "cli-failed" ? `Run: ${recoveryGlobalCommand(root, tag, empty)}` : globalRefusalGuidance;
+      return globalMergeWarningMessage(repoName(root), guidance);
+    };
+    if (current.kind === "reconcile") {
+      const empty = await readEmptyMarker(root) !== void 0 || (await readGraph(root))?.nodeCount === 0;
+      const warning = await reconcile(empty);
+      return warning ? { kind: "reconcile-failed", globalWarning: warning } : { kind: "reconciled" };
+    }
     await onStart(action);
     for (let attempt = 0; ; attempt += 1) {
       const headBefore = await gitValue(root, GIT_HEAD_ARGS);
-      let childPidRecorded = Promise.resolve();
+      let childPidRecorded = Promise.resolve(false);
       const run = await runGraphify(args, root, {
         onSpawn: (child) => {
-          childPidRecorded = recordLockChildPid(root, child.pid);
+          safeToRelease = false;
+          childPidRecorded = recordLockChildPid(lock, child.pid);
         },
         timeoutMs: extractTimeoutMs()
       });
-      await childPidRecorded;
+      if (!await childPidRecorded) return { kind: "action-failed", action };
       if (run.error || run.exitCode !== 0) {
         if (!run.error && EMPTY_CORPUS_PATTERN.test(`${run.stdout}
 ${run.stderr}`)) {
-          await writeEmptyMarker(root, await gitValue(root, GIT_HEAD_ARGS));
-          return { kind: "empty" };
+          if (headBefore !== await gitValue(root, GIT_HEAD_ARGS)) return { kind: "action-failed", action };
+          if (!await cleanGeneratedArtifacts(root)) return { kind: "action-failed", action };
+          if (!await writeEmptyMarker(root, headBefore)) return { kind: "action-failed", action };
+          if (!await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: true })) return { kind: "action-failed", action };
+          safeToRelease = true;
+          return { kind: "empty", globalWarning: await reconcile(true) };
         }
         const detail = run.error ? errorMessage(run.error) : run.stderr.trim();
         if (detail) console.error(`${LOG_PREFIX} ${action} failed for ${root}: ${detail}`);
@@ -533,18 +687,18 @@ ${run.stderr}`)) {
         console.error(`${LOG_PREFIX} HEAD kept moving during extraction of ${root}; giving up for this session`);
         return { kind: "action-failed", action };
       }
-      const globalRecovery = GLOBAL_MERGE_WARNING_PATTERN.test(`${run.stdout}
-${run.stderr}`) ? recoveryGlobalAddCommand(root, tag) : void 0;
-      await persistIndexMode(root, mode);
-      if (graph.nodeCount === 0) return { kind: "zero-nodes", globalRecovery };
-      await clearEmptyMarker(root);
-      return { kind: "ready", action, nodeCount: graph.nodeCount, globalRecovery };
+      if (!await clearEmptyMarker(root)) return { kind: "action-failed", action };
+      if (!await persistIndexState(root, { mode: MODE_CODE_ONLY, policyVersion: POLICY_VERSION, pendingGlobal: true })) return { kind: "action-failed", action };
+      safeToRelease = true;
+      const globalWarning = await reconcile(graph.nodeCount === 0);
+      if (graph.nodeCount === 0) return { kind: "zero-nodes", globalWarning };
+      return { kind: "ready", action, nodeCount: graph.nodeCount, globalWarning };
     }
   } finally {
-    await releaseExtractLock(root);
+    await releaseLock(lockFilePath(root), lock, safeToRelease);
   }
 }
-async function presentSingleRoot(input, root, action, mode) {
+async function presentSingleRoot(input, root, action) {
   const repo = repoName(root);
   let startedAt = Date.now();
   const onStart = async (started) => {
@@ -552,25 +706,31 @@ async function presentSingleRoot(input, root, action, mode) {
     const message = started === "update" ? updateStartMessage(repo) : buildStartMessage(repo);
     await showToastBestEffort(input, message, TOAST_VARIANTS.INFO, INFO_DURATION_MS);
   };
-  const outcome = await buildRepoGraph(root, action, mode, onStart);
-  const warnGlobalMerge = async (recovery) => {
-    if (!recovery) return;
-    await showToastBestEffort(input, globalMergeWarningMessage(repo, recovery), TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
+  const outcome = await buildRepoGraph(root, action, onStart);
+  const warnGlobal = async (warning) => {
+    if (!warning) return;
+    await showToastBestEffort(input, warning, TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
   };
   switch (outcome.kind) {
+    case "reconciled":
+      return;
+    case "reconcile-failed":
+      await warnGlobal(outcome.globalWarning);
+      return;
     case "empty":
       await showToastBestEffort(input, emptyCorpusMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
+      await warnGlobal(outcome.globalWarning);
       return;
     case "zero-nodes":
       await showToastBestEffort(input, zeroNodeMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
-      await warnGlobalMerge(outcome.globalRecovery);
+      await warnGlobal(outcome.globalWarning);
       return;
     case "locked":
       return;
     case "action-failed":
       await showToastBestEffort(
         input,
-        processFailureMessage(repo, recoveryBuildCommand(root, mode)),
+        processFailureMessage(repo, recoveryBuildCommand(root)),
         TOAST_VARIANTS.ERROR,
         ERROR_DURATION_MS
       );
@@ -578,7 +738,7 @@ async function presentSingleRoot(input, root, action, mode) {
     case "incomplete":
       await showToastBestEffort(
         input,
-        incompleteMessage(repo, recoveryBuildCommand(root, mode)),
+        incompleteMessage(repo, recoveryBuildCommand(root)),
         TOAST_VARIANTS.WARNING,
         WARNING_DURATION_MS
       );
@@ -590,7 +750,7 @@ async function presentSingleRoot(input, root, action, mode) {
         TOAST_VARIANTS.SUCCESS,
         INFO_DURATION_MS
       );
-      await warnGlobalMerge(outcome.globalRecovery);
+      await warnGlobal(outcome.globalWarning);
       return;
   }
 }
@@ -601,16 +761,18 @@ async function presentAggregate(input, root, work) {
   const failed = [];
   let built = 0;
   let locked = 0;
+  let reconciled = 0;
   for (const item of work) {
-    const outcome = await buildRepoGraph(item.root, item.action, item.mode, async () => {
+    const outcome = await buildRepoGraph(item.root, item.action, async () => {
     });
     if (outcome.kind === "ready") built += 1;
     else if (outcome.kind === "locked") locked += 1;
+    else if (outcome.kind === "reconciled") reconciled += 1;
     else if (outcome.kind !== "empty" && outcome.kind !== "zero-nodes") failed.push(item.root);
-    if ((outcome.kind === "ready" || outcome.kind === "zero-nodes") && outcome.globalRecovery) {
+    if ((outcome.kind === "ready" || outcome.kind === "zero-nodes" || outcome.kind === "empty" || outcome.kind === "reconcile-failed") && outcome.globalWarning) {
       await showToastBestEffort(
         input,
-        globalMergeWarningMessage(repoName(item.root), outcome.globalRecovery),
+        outcome.globalWarning,
         TOAST_VARIANTS.WARNING,
         WARNING_DURATION_MS
       );
@@ -618,6 +780,10 @@ async function presentAggregate(input, root, work) {
   }
   if (failed.length === 0) {
     if (built === 0) {
+      if (reconciled > 0) {
+        await showToastBestEffort(input, aggregateReconciledMessage(reconciled, rootName), TOAST_VARIANTS.SUCCESS, INFO_DURATION_MS);
+        return;
+      }
       if (locked > 0) return;
       await showToastBestEffort(input, aggregateEmptyMessage(rootName), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
       return;
@@ -679,7 +845,7 @@ async function collectWork(roots) {
   for (const root of roots) {
     const plan = await planRepo(root);
     if (plan.kind === "needs-consent") needsConsent.push(root);
-    else if (plan.kind !== "none") work.push({ root, action: plan.kind, mode: plan.mode });
+    else if (plan.kind !== "none") work.push({ root, action: plan.kind === "reconcile" ? "update" : plan.kind });
   }
   return { work, needsConsent };
 }
@@ -698,7 +864,7 @@ async function initializeGraphify(input) {
     await showToastBestEffort(input, missingBinaryMessage(), TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
     return;
   }
-  if (aggregated.length === 0) return presentSingleRoot(input, work[0].root, work[0].action, work[0].mode);
+  if (aggregated.length === 0) return presentSingleRoot(input, work[0].root, work[0].action);
   return presentAggregate(input, root, work);
 }
 var GraphifyInitPlugin = async (input) => {
