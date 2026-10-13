@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.7...v0.2.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **opencode:** migrate plugin to OpenCode v2 ([#29](https://github.com/andresnator/opencode-graphify-init/issues/29))
+
+### Features
+
+* **opencode:** migrate plugin to OpenCode v2 ([#29](https://github.com/andresnator/opencode-graphify-init/issues/29)) ([4a07a49](https://github.com/andresnator/opencode-graphify-init/commit/4a07a4934de20b771b9652162c84f93a9c679482))
+* Trigger notification ([#32](https://github.com/andresnator/opencode-graphify-init/issues/32)) ([4f0dfde](https://github.com/andresnator/opencode-graphify-init/commit/4f0dfde0392ffd5c95cef506f1308443fc8fa8cc))
+
 ## [0.1.7](https://github.com/andresnator/opencode-graphify-init/compare/v0.1.6...v0.1.7) (2026-09-23)
 
 
