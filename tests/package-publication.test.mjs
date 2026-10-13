@@ -6,7 +6,7 @@ const ROOT = new URL("../", import.meta.url)
 const PACKAGE_NAME = "opencode-graphify-init"
 const NPM_REGISTRY = "https://registry.npmjs.org/"
 const NODE_RANGE = ">=22.0.0"
-const OPENCODE_RANGE = ">=1.17.15 <2"
+const OPENCODE_RANGE = ">=2.0.27 <3"
 const NPM_LIFECYCLE_SCRIPTS = [
   "dependencies",
   "install",
@@ -30,15 +30,18 @@ const EXPECTED_PACKAGE_FILES = [
   "NOTICE.md",
   "README.md",
   "commands/graphify-index.md",
+  "dist/rpc.d.ts",
   "dist/server.d.ts",
   "dist/server.js",
+  "dist/tui.d.ts",
+  "dist/tui.js",
   "docs/lifecycle.md",
   "package.json",
 ]
 
 const packageJson = JSON.parse(await readFile(new URL("package.json", ROOT), "utf8"))
 
-function shouldExposeBothServerEntrypointsWhenPackageIsPublished() {
+function shouldExposeServerAndTuiEntrypointsWhenPackageIsPublished() {
   // Given
   const lifecycleScripts = NPM_LIFECYCLE_SCRIPTS.filter((script) => packageJson.scripts?.[script] !== undefined)
 
@@ -73,6 +76,10 @@ function shouldExposeBothServerEntrypointsWhenPackageIsPublished() {
       "./server": {
         types: "./dist/server.d.ts",
         import: "./dist/server.js",
+      },
+      "./tui": {
+        types: "./dist/tui.d.ts",
+        import: "./dist/tui.js",
       },
     },
     nodeEngine: NODE_RANGE,
@@ -127,7 +134,7 @@ async function shouldPublishCodeOnlyLifecycleGuidanceWhenPacked() {
   assert.doesNotMatch(publishedGuidance, /OPENCODE_GRAPHIFY_DOCS|OPENCODE_GRAPHIFY_BACKEND/)
 }
 
-shouldExposeBothServerEntrypointsWhenPackageIsPublished()
+shouldExposeServerAndTuiEntrypointsWhenPackageIsPublished()
 shouldContainOnlyTheExpectedFilesWhenPackageIsPacked()
 await shouldPublishCodeOnlyLifecycleGuidanceWhenPacked()
 process.stdout.write("PASS: 3 npm publication contracts.\n")

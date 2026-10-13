@@ -1,9 +1,19 @@
 import { spawn, type ChildProcess } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import fs, { type FileHandle } from "node:fs/promises"
 import path from "node:path"
-import type { Config, Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
+import {
+  ATTACH_METHOD,
+  DRAIN_METHOD,
+  GRAPHIFY_INIT_PLUGIN_ID,
+  GraphifyInitRpc,
+  TOAST_EVENT,
+  type GraphifyToast,
+  type ToastVariant,
+} from "./rpc.js"
 
-export const GRAPHIFY_INIT_PLUGIN_ID = "andresnator.graphify-init"
+export { GRAPHIFY_INIT_PLUGIN_ID }
 const LOG_PREFIX = "[graphify-init]"
 const GRAPHIFY_BINARY = "graphify"
 const GRAPHIFY_INSTALL_HINT = "uv tool install graphifyy (or pipx install graphifyy)"
@@ -71,16 +81,9 @@ const INFO_DURATION_MS = 5_000
 const HINT_DURATION_MS = 8_000
 const WARNING_DURATION_MS = 8_000
 const ERROR_DURATION_MS = 8_000
-// Toasts ride the event bus (`tui.toast.show`), and bus events published before a subscriber
-// attaches are dropped. The TUI subscribes to /event a second or two AFTER the instance
-// bootstraps — after this plugin has already scanned and toasted — and `server.connected` is
-// written straight to the new subscriber's SSE stream, never through the bus, so a plugin
-// cannot observe the TUI attaching. Toasts therefore queue until the first bus event this
-// plugin receives (a client is interacting, so it is subscribed) or until a fallback delay
-// comfortably past any real TUI subscription, whichever comes first. The env override exists
-// solely so the test suite can shrink or stretch the delay; it never changes behavior shape.
-const TOAST_READY_FALLBACK_MS = 10_000
-const TOAST_DELAY_ENV = "OPENCODE_GRAPHIFY_TOAST_DELAY_MS"
+// Undrained toasts are kept only for a TUI that attaches late; a headless server (web client,
+// `opencode serve` without a TUI) must not grow the queue without bound.
+const MAX_PENDING_TOASTS = 50
 // No spawn may hang forever. The extract holds the per-repo lock for its whole run, and the
 // lock is only released when the call resolves — so a wedged child (a docs-mode backend call
 // that never answers, a git probe on an unreachable network mount) blocks every later session
@@ -102,9 +105,7 @@ const TOAST_VARIANTS = {
   INFO: "info",
   SUCCESS: "success",
   WARNING: "warning",
-} as const
-
-type ToastVariant = (typeof TOAST_VARIANTS)[keyof typeof TOAST_VARIANTS]
+} as const satisfies Record<string, ToastVariant>
 
 type CommandResult = {
   exitCode: number | null
@@ -113,24 +114,8 @@ type CommandResult = {
   error?: Error
 }
 
-type ToastClient = {
-  tui: {
-    showToast(options: {
-      body: {
-        message: string
-        variant: ToastVariant
-        duration: number
-      }
-      query: {
-        directory: string
-      }
-    }): Promise<unknown>
-  }
-}
-
 type ToastInput = {
-  client: ToastClient
-  directory: string
+  notify: (message: string, variant: ToastVariant, duration: number) => Promise<void>
 }
 
 type RepoAction = "build" | "update"
@@ -203,10 +188,12 @@ const aggregateFailureMessage = (okCount: number, total: number, rootName: strin
   return `Graphify built ${okCount} of ${total} code graphs under ${rootName}. Failed: ${list}. Reopen the session to retry, or run ${INDEX_COMMAND}.`
 }
 
-function projectRoot(input: { worktree?: string; directory: string }) {
-  const reportedWorktree = input.worktree ?? ""
-  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory
-  return reportedWorktree
+// V2 reports the project (the Git worktree root, or the directory itself outside Git) beside
+// the session directory. A filesystem-root project is never a meaningful index target.
+function projectRoot(location: { directory: string; project?: { directory?: string } }) {
+  const reportedProject = location.project?.directory ?? ""
+  if (!reportedProject || reportedProject === path.parse(reportedProject).root) return location.directory
+  return reportedProject
 }
 
 function repoName(root: string) {
@@ -242,17 +229,25 @@ function loadIndexCommandTemplate() {
   return indexCommandTemplate
 }
 
-export async function registerGraphifyIndexCommand(config: Config) {
-  config.command ??= {}
-  if (config.command[INDEX_COMMAND_NAME]) {
-    return
-  }
+// A function replacer keeps `$&`-style sequences in user arguments literal.
+export function renderIndexCommand(template: string, argumentsText: string) {
+  return template.replaceAll("$ARGUMENTS", () => argumentsText.trim())
+}
 
-  config.command[INDEX_COMMAND_NAME] = {
-    template: await loadIndexCommandTemplate(),
-    description: INDEX_COMMAND_DESCRIPTION,
-    agent: "build",
-  }
+// V2 plugin commands own their execution: the bundled template is expanded with the raw
+// arguments and submitted to the invoking session as a regular prompt. Attachments are not
+// forwarded: their mention offsets index the arguments, not the expanded template.
+export async function registerGraphifyIndexCommand(context: Pick<Plugin.Context, "command" | "session">) {
+  const template = await loadIndexCommandTemplate()
+  return context.command.transform((editor) => {
+    editor.add({
+      name: INDEX_COMMAND_NAME,
+      description: INDEX_COMMAND_DESCRIPTION,
+      execute: async ({ sessionID, prompt, delivery }) => {
+        await context.session.prompt({ sessionID, text: renderIndexCommand(template, prompt.text), delivery })
+      },
+    })
+  })
 }
 
 // Keep the TAIL of each stream: Graphify's decisive lines — the empty-corpus signal and
@@ -725,80 +720,55 @@ function isGlobalEnabled() {
   return process.env[GLOBAL_ENV] !== GLOBAL_OPT_OUT
 }
 
-type PendingToast = {
-  input: ToastInput
-  message: string
-  variant: ToastVariant
-  duration: number
-}
-
-let toastClientReady = false
-let toastFallbackTimer: ReturnType<typeof setTimeout> | undefined
-const pendingToasts: PendingToast[] = []
-
-function toastFallbackDelayMs() {
-  const raw = process.env[TOAST_DELAY_ENV]
-  if (raw !== undefined) {
-    const parsed = Number(raw)
-    if (Number.isFinite(parsed) && parsed >= 0) return parsed
-  }
-  return TOAST_READY_FALLBACK_MS
-}
-
-async function sendToast(input: ToastInput, message: string, variant: ToastVariant, duration: number) {
-  try {
-    await input.client.tui.showToast({
-      body: { message, variant, duration },
-      query: { directory: input.directory },
-    })
-  } catch (error) {
-    console.error(`${LOG_PREFIX} toast failed: ${errorMessage(error)}`)
-  }
-}
-
-// Only events a connected client causes prove the TUI is subscribed. Server housekeeping
-// (file watcher, VCS branch detection, LSP) also rides the bus during boot, before any
-// subscriber exists — flushing on those would lose the queue all over again.
-const CLIENT_EVENT_PREFIXES = ["session.", "message.", "permission.", "tui.", "command."] as const
-
-function isClientDrivenEvent(type: string) {
-  return CLIENT_EVENT_PREFIXES.some((prefix) => type.startsWith(prefix))
-}
-
-async function releaseQueuedToasts() {
-  if (toastClientReady) return
-  toastClientReady = true
-  if (toastFallbackTimer !== undefined) {
-    clearTimeout(toastFallbackTimer)
-    toastFallbackTimer = undefined
-  }
-  for (const toast of pendingToasts.splice(0)) {
-    await sendToast(toast.input, toast.message, toast.variant, toast.duration)
-  }
-}
-
-// unref keeps the timer from holding the server process open at shutdown; pending toasts
-// simply die with the process, which is the right outcome for a session nobody ever saw.
-function armToastFallback() {
-  if (toastClientReady || toastFallbackTimer !== undefined) return
-  toastFallbackTimer = setTimeout(() => {
-    toastFallbackTimer = undefined
-    void releaseQueuedToasts()
-  }, toastFallbackDelayMs())
-  toastFallbackTimer.unref?.()
-}
-
 async function showToastBestEffort(
   input: ToastInput,
   message: string,
   variant: ToastVariant,
   duration: number,
 ) {
-  if (!toastClientReady) {
-    pendingToasts.push({ input, message, variant, duration })
-    return
+  try {
+    await input.notify(message, variant, duration)
+  } catch (error) {
+    console.error(`${LOG_PREFIX} toast failed: ${errorMessage(error)}`)
   }
-  await sendToast(input, message, variant, duration)
+}
+
+type ToastChannel = ToastInput & { dispose: () => void }
+
+// Every toast is queued for the next drain AND emitted live; the TUI de-duplicates by id.
+// Without a registered channel (an RPC registration failure) toasts degrade to the log.
+async function openToastChannel(rpc: Plugin.Context["rpc"], onAttach: () => void): Promise<ToastChannel> {
+  const pending: GraphifyToast[] = []
+  let disposed = false
+  let registration: Awaited<ReturnType<typeof rpc.register<typeof GraphifyInitRpc>>> | undefined
+  try {
+    registration = await rpc.register(GraphifyInitRpc, {
+      [ATTACH_METHOD]: async () => {
+        onAttach()
+        return { toasts: pending.splice(0) }
+      },
+      [DRAIN_METHOD]: async () => ({ toasts: pending.splice(0) }),
+    })
+  } catch (error) {
+    console.error(`${LOG_PREFIX} cannot register toast channel: ${errorMessage(error)}`)
+  }
+  return {
+    notify: async (message, variant, duration) => {
+      if (disposed) return
+      if (!registration) {
+        console.error(`${LOG_PREFIX} ${variant}: ${message}`)
+        return
+      }
+      const toast: GraphifyToast = { id: randomUUID(), message, variant, duration }
+      pending.push(toast)
+      if (pending.length > MAX_PENDING_TOASTS) pending.splice(0, pending.length - MAX_PENDING_TOASTS)
+      await registration.events.emit(TOAST_EVENT, toast)
+    },
+    dispose: () => {
+      disposed = true
+      pending.length = 0
+    },
+  }
 }
 
 async function resolveGitExcludePath(root: string) {
@@ -1159,23 +1129,33 @@ async function initializeGraphify(input: ToastInput & { root: string }) {
   return presentAggregate(input, root, work)
 }
 
-export const GraphifyInitPlugin: Plugin = async (input) => {
-  const root = projectRoot(input)
-  armToastFallback()
-  void initializeGraphify({ client: input.client, directory: input.directory, root }).catch((error) => {
-    console.error(`${LOG_PREFIX} ${errorMessage(error)}`)
-  })
-  return {
-    config: registerGraphifyIndexCommand,
-    // A client-driven bus event means a subscribed client is interacting, so queued
-    // toasts can land; boot-time housekeeping events must not trip the latch.
-    event: async ({ event }) => {
-      if (isClientDrivenEvent(event?.type ?? "")) await releaseQueuedToasts()
-    },
-  }
+export const GraphifyInitPlugin: Plugin.Plugin = {
+  id: GRAPHIFY_INIT_PLUGIN_ID,
+  // V2 runs setup once per location (directory) for the server's lifetime. A V1 instance lived
+  // as long as one terminal session, but the V2 background service outlives many, so every TUI
+  // after the first that attaches here starts a fresh run, as a new V1 launch did.
+  async setup(context) {
+    const root = projectRoot(context.location)
+    let attached = false
+    let running: Promise<void> | undefined
+    const initialize = () => {
+      if (running) return
+      running = initializeGraphify({ notify: channel.notify, root })
+        .catch((error) => console.error(`${LOG_PREFIX} ${errorMessage(error)}`))
+        .finally(() => {
+          running = undefined
+        })
+    }
+    const channel = await openToastChannel(context.rpc, () => {
+      if (attached) initialize()
+      attached = true
+    })
+    await registerGraphifyIndexCommand(context)
+    initialize()
+    // Registrations are disposed by the host. A running extract is deliberately left alone:
+    // the process shutdown hooks own termination, and its lock keeps the recovery contract.
+    return () => channel.dispose()
+  },
 }
 
-export default {
-  id: GRAPHIFY_INIT_PLUGIN_ID,
-  server: GraphifyInitPlugin,
-}
+export default GraphifyInitPlugin

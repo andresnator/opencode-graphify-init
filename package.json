@@ -15,6 +15,10 @@
     "./server": {
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
     }
   },
   "files": [
@@ -39,13 +43,13 @@
   },
   "engines": {
     "node": ">=22.0.0",
-    "opencode": ">=1.17.15 <2"
+    "opencode": ">=2.0.27 <3"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.13",
+    "@opencode/cli": "2.0.27",
+    "@opencode/plugin": "2.0.27",
     "@types/node": "26.2.0",
     "esbuild": "0.28.1",
-    "opencode-ai": "1.18.13",
     "typescript": "5.9.3"
   },
   "publishConfig": {

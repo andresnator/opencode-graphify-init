@@ -1,8 +1,46 @@
 // src/server.ts
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+
+// src/rpc.ts
 var GRAPHIFY_INIT_PLUGIN_ID = "andresnator.graphify-init";
+var TOAST_EVENT = "toast";
+var ATTACH_METHOD = "attach";
+var DRAIN_METHOD = "drain";
+var toastSchema = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    message: { type: "string" },
+    variant: { type: "string", enum: ["error", "info", "success", "warning"] },
+    duration: { type: "number" }
+  },
+  required: ["id", "message", "variant", "duration"]
+};
+var queuedToastsMethod = {
+  // The host requires an input schema even for argument-less methods.
+  input: { type: "object", properties: {} },
+  output: {
+    type: "object",
+    properties: { toasts: { type: "array", items: toastSchema } },
+    required: ["toasts"]
+  }
+};
+var GraphifyInitRpc = {
+  id: GRAPHIFY_INIT_PLUGIN_ID,
+  methods: {
+    [ATTACH_METHOD]: queuedToastsMethod,
+    [DRAIN_METHOD]: queuedToastsMethod
+  },
+  events: {
+    [TOAST_EVENT]: { schema: toastSchema }
+  }
+};
+var TOAST_VARIANTS = toastSchema.properties.variant.enum;
+
+// src/server.ts
 var LOG_PREFIX = "[graphify-init]";
 var GRAPHIFY_BINARY = "graphify";
 var GRAPHIFY_INSTALL_HINT = "uv tool install graphifyy (or pipx install graphifyy)";
@@ -49,14 +87,13 @@ var INFO_DURATION_MS = 5e3;
 var HINT_DURATION_MS = 8e3;
 var WARNING_DURATION_MS = 8e3;
 var ERROR_DURATION_MS = 8e3;
-var TOAST_READY_FALLBACK_MS = 1e4;
-var TOAST_DELAY_ENV = "OPENCODE_GRAPHIFY_TOAST_DELAY_MS";
+var MAX_PENDING_TOASTS = 50;
 var PROBE_TIMEOUT_MS = 15e3;
 var EXTRACT_TIMEOUT_MS = 30 * 60 * 1e3;
 var EXTRACT_TIMEOUT_ENV = "OPENCODE_GRAPHIFY_EXTRACT_TIMEOUT_MS";
 var KILL_GRACE_MS = 2e3;
 var timedOutMessage = (binary, timeoutMs) => `${binary} exceeded its ${Math.round(timeoutMs / 1e3)}s budget and was terminated`;
-var TOAST_VARIANTS = {
+var TOAST_VARIANTS2 = {
   ERROR: "error",
   INFO: "info",
   SUCCESS: "success",
@@ -86,10 +123,10 @@ var aggregateFailureMessage = (okCount, total, rootName, failedNames) => {
   const list = overflow > 0 ? `${shown.join(", ")}, +${overflow} more` : shown.join(", ");
   return `Graphify built ${okCount} of ${total} code graphs under ${rootName}. Failed: ${list}. Reopen the session to retry, or run ${INDEX_COMMAND}.`;
 };
-function projectRoot(input) {
-  const reportedWorktree = input.worktree ?? "";
-  if (!reportedWorktree || reportedWorktree === path.parse(reportedWorktree).root) return input.directory;
-  return reportedWorktree;
+function projectRoot(location) {
+  const reportedProject = location.project?.directory ?? "";
+  if (!reportedProject || reportedProject === path.parse(reportedProject).root) return location.directory;
+  return reportedProject;
 }
 function repoName(root) {
   return path.basename(root) || root;
@@ -114,16 +151,20 @@ function loadIndexCommandTemplate() {
   indexCommandTemplate ??= fs.readFile(INDEX_COMMAND_FILE, "utf8").then((template) => template.trim());
   return indexCommandTemplate;
 }
-async function registerGraphifyIndexCommand(config) {
-  config.command ??= {};
-  if (config.command[INDEX_COMMAND_NAME]) {
-    return;
-  }
-  config.command[INDEX_COMMAND_NAME] = {
-    template: await loadIndexCommandTemplate(),
-    description: INDEX_COMMAND_DESCRIPTION,
-    agent: "build"
-  };
+function renderIndexCommand(template, argumentsText) {
+  return template.replaceAll("$ARGUMENTS", () => argumentsText.trim());
+}
+async function registerGraphifyIndexCommand(context) {
+  const template = await loadIndexCommandTemplate();
+  return context.command.transform((editor) => {
+    editor.add({
+      name: INDEX_COMMAND_NAME,
+      description: INDEX_COMMAND_DESCRIPTION,
+      execute: async ({ sessionID, prompt, delivery }) => {
+        await context.session.prompt({ sessionID, text: renderIndexCommand(template, prompt.text), delivery });
+      }
+    });
+  });
 }
 function appendBoundedOutput(current, chunk) {
   return `${current}${String(chunk)}`.slice(-MAX_CAPTURED_OUTPUT_LENGTH);
@@ -525,56 +566,45 @@ function slugify(value) {
 function isGlobalEnabled() {
   return process.env[GLOBAL_ENV] !== GLOBAL_OPT_OUT;
 }
-var toastClientReady = false;
-var toastFallbackTimer;
-var pendingToasts = [];
-function toastFallbackDelayMs() {
-  const raw = process.env[TOAST_DELAY_ENV];
-  if (raw !== void 0) {
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
-  }
-  return TOAST_READY_FALLBACK_MS;
-}
-async function sendToast(input, message, variant, duration) {
+async function showToastBestEffort(input, message, variant, duration) {
   try {
-    await input.client.tui.showToast({
-      body: { message, variant, duration },
-      query: { directory: input.directory }
-    });
+    await input.notify(message, variant, duration);
   } catch (error) {
     console.error(`${LOG_PREFIX} toast failed: ${errorMessage(error)}`);
   }
 }
-var CLIENT_EVENT_PREFIXES = ["session.", "message.", "permission.", "tui.", "command."];
-function isClientDrivenEvent(type) {
-  return CLIENT_EVENT_PREFIXES.some((prefix) => type.startsWith(prefix));
-}
-async function releaseQueuedToasts() {
-  if (toastClientReady) return;
-  toastClientReady = true;
-  if (toastFallbackTimer !== void 0) {
-    clearTimeout(toastFallbackTimer);
-    toastFallbackTimer = void 0;
+async function openToastChannel(rpc, onAttach) {
+  const pending = [];
+  let disposed = false;
+  let registration;
+  try {
+    registration = await rpc.register(GraphifyInitRpc, {
+      [ATTACH_METHOD]: async () => {
+        onAttach();
+        return { toasts: pending.splice(0) };
+      },
+      [DRAIN_METHOD]: async () => ({ toasts: pending.splice(0) })
+    });
+  } catch (error) {
+    console.error(`${LOG_PREFIX} cannot register toast channel: ${errorMessage(error)}`);
   }
-  for (const toast of pendingToasts.splice(0)) {
-    await sendToast(toast.input, toast.message, toast.variant, toast.duration);
-  }
-}
-function armToastFallback() {
-  if (toastClientReady || toastFallbackTimer !== void 0) return;
-  toastFallbackTimer = setTimeout(() => {
-    toastFallbackTimer = void 0;
-    void releaseQueuedToasts();
-  }, toastFallbackDelayMs());
-  toastFallbackTimer.unref?.();
-}
-async function showToastBestEffort(input, message, variant, duration) {
-  if (!toastClientReady) {
-    pendingToasts.push({ input, message, variant, duration });
-    return;
-  }
-  await sendToast(input, message, variant, duration);
+  return {
+    notify: async (message, variant, duration) => {
+      if (disposed) return;
+      if (!registration) {
+        console.error(`${LOG_PREFIX} ${variant}: ${message}`);
+        return;
+      }
+      const toast = { id: randomUUID(), message, variant, duration };
+      pending.push(toast);
+      if (pending.length > MAX_PENDING_TOASTS) pending.splice(0, pending.length - MAX_PENDING_TOASTS);
+      await registration.events.emit(TOAST_EVENT, toast);
+    },
+    dispose: () => {
+      disposed = true;
+      pending.length = 0;
+    }
+  };
 }
 async function resolveGitExcludePath(root) {
   const result = await runCommand(GIT_BINARY, GIT_EXCLUDE_ARGS, root);
@@ -704,12 +734,12 @@ async function presentSingleRoot(input, root, action) {
   const onStart = async (started) => {
     startedAt = Date.now();
     const message = started === "update" ? updateStartMessage(repo) : buildStartMessage(repo);
-    await showToastBestEffort(input, message, TOAST_VARIANTS.INFO, INFO_DURATION_MS);
+    await showToastBestEffort(input, message, TOAST_VARIANTS2.INFO, INFO_DURATION_MS);
   };
   const outcome = await buildRepoGraph(root, action, onStart);
   const warnGlobal = async (warning) => {
     if (!warning) return;
-    await showToastBestEffort(input, warning, TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
+    await showToastBestEffort(input, warning, TOAST_VARIANTS2.WARNING, WARNING_DURATION_MS);
   };
   switch (outcome.kind) {
     case "reconciled":
@@ -718,11 +748,11 @@ async function presentSingleRoot(input, root, action) {
       await warnGlobal(outcome.globalWarning);
       return;
     case "empty":
-      await showToastBestEffort(input, emptyCorpusMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
+      await showToastBestEffort(input, emptyCorpusMessage(repo), TOAST_VARIANTS2.INFO, INFO_DURATION_MS);
       await warnGlobal(outcome.globalWarning);
       return;
     case "zero-nodes":
-      await showToastBestEffort(input, zeroNodeMessage(repo), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
+      await showToastBestEffort(input, zeroNodeMessage(repo), TOAST_VARIANTS2.INFO, INFO_DURATION_MS);
       await warnGlobal(outcome.globalWarning);
       return;
     case "locked":
@@ -731,7 +761,7 @@ async function presentSingleRoot(input, root, action) {
       await showToastBestEffort(
         input,
         processFailureMessage(repo, recoveryBuildCommand(root)),
-        TOAST_VARIANTS.ERROR,
+        TOAST_VARIANTS2.ERROR,
         ERROR_DURATION_MS
       );
       return;
@@ -739,7 +769,7 @@ async function presentSingleRoot(input, root, action) {
       await showToastBestEffort(
         input,
         incompleteMessage(repo, recoveryBuildCommand(root)),
-        TOAST_VARIANTS.WARNING,
+        TOAST_VARIANTS2.WARNING,
         WARNING_DURATION_MS
       );
       return;
@@ -747,7 +777,7 @@ async function presentSingleRoot(input, root, action) {
       await showToastBestEffort(
         input,
         successMessage(repo, outcome.nodeCount, formatElapsed(Date.now() - startedAt)),
-        TOAST_VARIANTS.SUCCESS,
+        TOAST_VARIANTS2.SUCCESS,
         INFO_DURATION_MS
       );
       await warnGlobal(outcome.globalWarning);
@@ -756,7 +786,7 @@ async function presentSingleRoot(input, root, action) {
 }
 async function presentAggregate(input, root, work) {
   const rootName = repoName(root);
-  await showToastBestEffort(input, aggregateStartMessage(work.length, rootName), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
+  await showToastBestEffort(input, aggregateStartMessage(work.length, rootName), TOAST_VARIANTS2.INFO, INFO_DURATION_MS);
   const startedAt = Date.now();
   const failed = [];
   let built = 0;
@@ -773,7 +803,7 @@ async function presentAggregate(input, root, work) {
       await showToastBestEffort(
         input,
         outcome.globalWarning,
-        TOAST_VARIANTS.WARNING,
+        TOAST_VARIANTS2.WARNING,
         WARNING_DURATION_MS
       );
     }
@@ -781,17 +811,17 @@ async function presentAggregate(input, root, work) {
   if (failed.length === 0) {
     if (built === 0) {
       if (reconciled > 0) {
-        await showToastBestEffort(input, aggregateReconciledMessage(reconciled, rootName), TOAST_VARIANTS.SUCCESS, INFO_DURATION_MS);
+        await showToastBestEffort(input, aggregateReconciledMessage(reconciled, rootName), TOAST_VARIANTS2.SUCCESS, INFO_DURATION_MS);
         return;
       }
       if (locked > 0) return;
-      await showToastBestEffort(input, aggregateEmptyMessage(rootName), TOAST_VARIANTS.INFO, INFO_DURATION_MS);
+      await showToastBestEffort(input, aggregateEmptyMessage(rootName), TOAST_VARIANTS2.INFO, INFO_DURATION_MS);
       return;
     }
     await showToastBestEffort(
       input,
       aggregateSuccessMessage(built, rootName, formatElapsed(Date.now() - startedAt)),
-      TOAST_VARIANTS.SUCCESS,
+      TOAST_VARIANTS2.SUCCESS,
       INFO_DURATION_MS
     );
     return;
@@ -804,7 +834,7 @@ async function presentAggregate(input, root, work) {
       rootName,
       failed.map((repo) => path.relative(root, repo))
     ),
-    TOAST_VARIANTS.WARNING,
+    TOAST_VARIANTS2.WARNING,
     WARNING_DURATION_MS
   );
 }
@@ -857,38 +887,45 @@ async function initializeGraphify(input) {
   const { work, needsConsent } = await collectWork(roots);
   if (needsConsent.length > 0) {
     const message = aggregated.length === 0 ? noGraphMessage(repoName(needsConsent[0])) : aggregateNoGraphMessage(needsConsent.length, repoName(root));
-    await showToastBestEffort(input, message, TOAST_VARIANTS.INFO, HINT_DURATION_MS);
+    await showToastBestEffort(input, message, TOAST_VARIANTS2.INFO, HINT_DURATION_MS);
   }
   if (work.length === 0) return;
   if (await isBinaryMissing(root)) {
-    await showToastBestEffort(input, missingBinaryMessage(), TOAST_VARIANTS.WARNING, WARNING_DURATION_MS);
+    await showToastBestEffort(input, missingBinaryMessage(), TOAST_VARIANTS2.WARNING, WARNING_DURATION_MS);
     return;
   }
   if (aggregated.length === 0) return presentSingleRoot(input, work[0].root, work[0].action);
   return presentAggregate(input, root, work);
 }
-var GraphifyInitPlugin = async (input) => {
-  const root = projectRoot(input);
-  armToastFallback();
-  void initializeGraphify({ client: input.client, directory: input.directory, root }).catch((error) => {
-    console.error(`${LOG_PREFIX} ${errorMessage(error)}`);
-  });
-  return {
-    config: registerGraphifyIndexCommand,
-    // A client-driven bus event means a subscribed client is interacting, so queued
-    // toasts can land; boot-time housekeeping events must not trip the latch.
-    event: async ({ event }) => {
-      if (isClientDrivenEvent(event?.type ?? "")) await releaseQueuedToasts();
-    }
-  };
-};
-var server_default = {
+var GraphifyInitPlugin = {
   id: GRAPHIFY_INIT_PLUGIN_ID,
-  server: GraphifyInitPlugin
+  // V2 runs setup once per location (directory) for the server's lifetime. A V1 instance lived
+  // as long as one terminal session, but the V2 background service outlives many, so every TUI
+  // after the first that attaches here starts a fresh run, as a new V1 launch did.
+  async setup(context) {
+    const root = projectRoot(context.location);
+    let attached = false;
+    let running;
+    const initialize = () => {
+      if (running) return;
+      running = initializeGraphify({ notify: channel.notify, root }).catch((error) => console.error(`${LOG_PREFIX} ${errorMessage(error)}`)).finally(() => {
+        running = void 0;
+      });
+    };
+    const channel = await openToastChannel(context.rpc, () => {
+      if (attached) initialize();
+      attached = true;
+    });
+    await registerGraphifyIndexCommand(context);
+    initialize();
+    return () => channel.dispose();
+  }
 };
+var server_default = GraphifyInitPlugin;
 export {
   GRAPHIFY_INIT_PLUGIN_ID,
   GraphifyInitPlugin,
   server_default as default,
-  registerGraphifyIndexCommand
+  registerGraphifyIndexCommand,
+  renderIndexCommand
 };

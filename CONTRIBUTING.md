@@ -1,6 +1,6 @@
 # Contributing
 
-Use Node.js `22.23.2`, pnpm `12.5.1`, OpenCode `1.18.13`, and Graphify `0.9.32`.
+Use Node.js `22.23.2`, pnpm `12.5.1`, OpenCode `2.0.27`, and Graphify `0.9.32`.
 
 ## Quick path
 
@@ -10,19 +10,23 @@ pnpm run check
 pnpm run security:check
 ```
 
-CI also verifies a first npm installation with an empty cache on OpenCode 1.18.0, 1.18.20, and the latest 1.x release.
+CI also verifies a first npm installation with an empty cache on OpenCode 2.0.27 and the latest 2.x release.
 
 Keep one behavior per change. Update its tests and public documentation before opening a pull request. Do not rewrite `pnpm-lock.yaml` with npm, Yarn, or another pnpm version.
 
 ## Test local source
 
-Use isolated OpenCode configuration when possible. Register the checkout under test with:
+Use isolated OpenCode configuration when possible. `opencode plugin add` accepts only packages, so build the checkout and list its `dist` directory in `plugins` of the global `opencode.json`:
 
 ```bash
-opencode plugin "$PWD" --global --force
+pnpm run build
 ```
 
-Keep the checkout at that path, restart OpenCode, and verify `/graphify-index` plus background refresh behavior.
+```json
+{ "plugins": ["/absolute/path/to/opencode-graphify-init/dist"] }
+```
+
+OpenCode loads a local directory through its top-level `server` and `tui` modules, so the checkout root itself does not load. Keep the checkout at that path, rebuild after each change, restart OpenCode, and verify `/graphify-index`, its notifications, and background refresh behavior. `scripts/test-graphify-init.sh` loads `src` the same way.
 
 ## Preserve contracts
 

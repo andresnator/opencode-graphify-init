@@ -17,7 +17,7 @@ function shouldPinPnpm12ExactlyAcrossBothCIJobsWithoutManagerTrustException() {
   assert.deepEqual(setupVersions, ["12.5.1", "12.5.1"])
   assert.doesNotMatch(workspace, /^\s*- pnpm@10\.34\.5\s*$/m)
   assert.match(workspace, /^trustPolicy: no-downgrade$/m)
-  assert.match(workspace, /^\s+- effect@4\.0\.0-beta\.83$/m)
+  assert.doesNotMatch(workspace, /^trustPolicyExclude:/m)
 }
 
 function shouldConfigurePnpmToRejectManagerMismatchWithoutDownloading() {
@@ -33,11 +33,12 @@ function shouldConfigurePnpmToRejectManagerMismatchWithoutDownloading() {
 }
 
 function shouldTestCleanCacheInstallationAcrossSupportedOpenCodeVersions() {
-  for (const version of ["1.18.0", "1.18.20", '"1"']) {
+  for (const version of ["2.0.27", '"2"']) {
     assert.ok(workflow.includes(`version: ${version}`), `CI is missing OpenCode ${version}`)
   }
   for (const contract of [
     "npm install --prefix \"$OPENCODE_INSTALL_ROOT\"",
+    "\"@opencode/cli@$OPENCODE_VERSION\"",
     "OPENCODE_BIN: ${{ runner.temp }}/opencode-${{ matrix.id }}/node_modules/.bin/opencode",
     "pnpm run test:install",
   ]) assert.ok(workflow.includes(contract), `CI is missing compatibility contract: ${contract}`)
@@ -46,4 +47,4 @@ function shouldTestCleanCacheInstallationAcrossSupportedOpenCodeVersions() {
 shouldPinPnpm12ExactlyAcrossBothCIJobsWithoutManagerTrustException()
 shouldConfigurePnpmToRejectManagerMismatchWithoutDownloading()
 shouldTestCleanCacheInstallationAcrossSupportedOpenCodeVersions()
-process.stdout.write("PASS: clean-cache installation CI covers OpenCode 1.18 and latest 1.x.\n")
+process.stdout.write("PASS: clean-cache installation CI covers OpenCode 2.0.27 and latest 2.x.\n")

@@ -4,18 +4,12 @@ packages:
 auditLevel: low
 minimumReleaseAge: 1440
 trustPolicy: no-downgrade
-# This exact beta passes npm's registry-signature audit but cannot be
-# compared reliably by pnpm's trust-history policy.
-trustPolicyExclude:
-  - effect@4.0.0-beta.83
 blockExoticSubdeps: true
 strictDepBuilds: true
-# esbuild and the OpenCode test binary require their platform installers;
-# the optional msgpackr native accelerator is unnecessary for this plugin.
+# esbuild and the OpenCode test binary require their platform installers.
 allowBuilds:
   esbuild@0.28.1: true
-  opencode-ai@1.18.13: true
-  msgpackr-extract@3.0.4: false
+  "@opencode/cli@2.0.27": true
 pmOnFail: error
 verifyDepsBeforeRun: error
 engineStrict: true
