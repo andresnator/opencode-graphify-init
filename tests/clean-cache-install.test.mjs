@@ -2,7 +2,9 @@ import assert from "node:assert/strict"
 import { spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { createServer } from "node:http"
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, stat } from "node:fs/promises"
+import { once } from "node:events"
+import { setTimeout as delay } from "node:timers/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -22,8 +24,10 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
   const dataHome = path.join(temporaryRoot, "data")
   const cacheHome = path.join(temporaryRoot, "cache")
   const npmCache = path.join(temporaryRoot, "npm-cache")
+  const home = path.join(temporaryRoot, "home")
+  const project = path.join(temporaryRoot, "packed-project")
   const requests = []
-  await Promise.all([mkdir(packageDirectory), mkdir(configHome), mkdir(dataHome), mkdir(cacheHome), mkdir(npmCache)])
+  await Promise.all([packageDirectory, configHome, dataHome, cacheHome, npmCache, home, project].map((directory) => mkdir(directory)))
 
   let registry
   try {
@@ -31,9 +35,7 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
     registry = await startRegistry(tarball, requests)
 
     // When
-    const result = await runProcess(process.env.OPENCODE_BIN ?? DEFAULT_OPENCODE_BIN, [
-      "plugin", packageSpec, "--global", "--pure", "--print-logs", "--log-level", "DEBUG",
-    ], {
+    const env = {
       ...process.env,
       CI: "true",
       NO_COLOR: "1",
@@ -46,22 +48,31 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
       XDG_CACHE_HOME: cacheHome,
       XDG_CONFIG_HOME: configHome,
       XDG_DATA_HOME: dataHome,
-    })
+      XDG_STATE_HOME: path.join(temporaryRoot, "state"),
+      HOME: home,
+      OPENCODE_SERVER_PASSWORD: "graphify-test-password",
+      OPENCODE_GRAPHIFY_AUTOINIT: "1",
+    }
+    for (const key of ["OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_PROJECT_DISABLE", "OPENCODE_DISABLE_PROJECT_CONFIG"]) delete env[key]
+    const result = await runProcess(process.env.OPENCODE_BIN ?? DEFAULT_OPENCODE_BIN, [
+      "plugin", "add", packageSpec, "--print-logs", "--log-level", "debug",
+    ], env)
 
     // Then
     const output = stripAnsi(`${result.stdout}\n${result.stderr}`)
     assert.equal(result.timedOut, false, `OpenCode installation timed out:\n${output}`)
     assert.equal(result.code, 0, `first OpenCode installation failed:\n${output}\nregistry requests: ${requests.join(", ")}`)
-    assert.match(output, /Detected server target/)
+    assert.match(output, /installed and added/)
     assert.ok(requests.includes(`GET /${PACKAGE_NAME}`), "OpenCode did not request the package metadata")
     assert.ok(
       requests.includes(`GET /${PACKAGE_NAME}/-/${PACKAGE_NAME}-${packageJson.version}.tgz`),
       `OpenCode did not download the packed artifact: ${requests.join(", ")}`,
     )
 
-    const configFile = path.join(configHome, "opencode", "opencode.jsonc")
+    const configFile = path.join(configHome, "opencode", "opencode.json")
     const config = JSON.parse(await readFile(configFile, "utf8"))
-    assert.deepEqual(config.plugin, [packageSpec])
+    assert.deepEqual(config.plugins, [packageSpec])
+    await verifyInstalledRuntime(env, project)
 
     const version = await runProcess(process.env.OPENCODE_BIN ?? DEFAULT_OPENCODE_BIN, ["--version"], process.env)
     assert.equal(version.code, 0, version.stderr)
@@ -69,6 +80,56 @@ async function shouldInstallOnFirstAttemptWhenCacheIsEmpty() {
   } finally {
     await registry?.close()
     await rm(temporaryRoot, { recursive: true, force: true })
+  }
+}
+
+async function verifyInstalledRuntime(env, project) {
+  const server = spawn(process.env.OPENCODE_BIN ?? DEFAULT_OPENCODE_BIN, [
+    "serve", "--hostname", "127.0.0.1", "--port", "0", "--print-logs", "--log-level", "error",
+  ], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] })
+  let logs = ""
+  server.stdout.on("data", (chunk) => { logs += chunk })
+  server.stderr.on("data", (chunk) => { logs += chunk })
+  const stopped = once(server, "exit")
+  try {
+    const deadline = Date.now() + INSTALL_TIMEOUT_MS
+    let baseUrl
+    while (Date.now() < deadline && server.exitCode === null) {
+      baseUrl = logs.match(/server listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1]
+      if (baseUrl) break
+      await delay(50)
+    }
+    assert.ok(baseUrl, `packed plugin server did not start:\n${logs}`)
+    const headers = { authorization: `Basic ${Buffer.from("opencode:graphify-test-password").toString("base64")}` }
+    const location = `?${new URLSearchParams({ "location[directory]": project })}`
+    const get = async (endpoint) => {
+      const response = await fetch(`${baseUrl}/api/${endpoint}${location}`, { headers, signal: AbortSignal.timeout(5_000) })
+      if (response.status !== 200) assert.fail(`HTTP ${response.status}: ${await response.text()}`)
+      return response.json()
+    }
+    let installed
+    while (Date.now() < deadline) {
+      installed = (await get("plugin")).data.find((plugin) => plugin.id === "andresnator.graphify-init")
+      if (installed?.state.status === "active") break
+      if (installed?.state.status === "failed") assert.fail(JSON.stringify(installed))
+      await delay(50)
+    }
+    assert.equal(installed?.state.status, "active", `packed plugin did not activate:\n${logs}`)
+    assert.deepEqual(installed.features, { server: true, tui: true })
+    assert.equal(installed.source.type, "package")
+    assert.ok((await get("command")).data.some((command) => command.name === "graphify-index"))
+    const response = await fetch(`${baseUrl}/api/rpc/andresnator.graphify-init/notifications${location}`, {
+      method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ input: {} }),
+      signal: AbortSignal.timeout(5_000),
+    })
+    assert.equal(response.status, 200)
+    const backlog = (await response.json()).output
+    assert.ok(backlog.some((notification) => /packed-project.*authorize code-only indexing/.test(notification.message)))
+    await assert.rejects(stat(path.join(project, ".ai")), { code: "ENOENT" })
+  } finally {
+    server.kill("SIGTERM")
+    const timer = setTimeout(() => server.kill("SIGKILL"), 5_000)
+    try { await stopped } finally { clearTimeout(timer) }
   }
 }
 

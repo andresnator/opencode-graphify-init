@@ -64,15 +64,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: minimum-1-18
-            label: 1.18.0
-            version: 1.18.0
-          - id: reported-version
-            label: 1.18.20
-            version: 1.18.20
-          - id: latest-v1
-            label: latest 1.x
-            version: "1"
+          - id: minimum-v2
+            label: 2.0.28
+            version: 2.0.28
+          - id: latest-v2
+            label: latest 2.x
+            version: "2"
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -94,8 +91,8 @@ jobs:
         env:
           OPENCODE_INSTALL_ROOT: ${{ runner.temp }}/opencode-${{ matrix.id }}
           OPENCODE_VERSION: ${{ matrix.version }}
-        run: npm install --prefix "$OPENCODE_INSTALL_ROOT" --no-audit --no-fund "opencode-ai@$OPENCODE_VERSION"
+        run: npm install --prefix "$OPENCODE_INSTALL_ROOT" --no-audit --no-fund "@opencode/cli@$OPENCODE_VERSION"
       - name: Verify first clean-cache installation
         env:
           OPENCODE_BIN: ${{ runner.temp }}/opencode-${{ matrix.id }}/node_modules/.bin/opencode
-        run: pnpm run test:install
+        run: pnpm run test:install && bash scripts/test-graphify-init.sh

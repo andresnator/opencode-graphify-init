@@ -6,7 +6,7 @@ const ROOT = new URL("../", import.meta.url)
 const PACKAGE_NAME = "opencode-graphify-init"
 const NPM_REGISTRY = "https://registry.npmjs.org/"
 const NODE_RANGE = ">=22.0.0"
-const OPENCODE_RANGE = ">=1.17.15 <2"
+const OPENCODE_RANGE = ">=2.0.28 <3"
 const NPM_LIFECYCLE_SCRIPTS = [
   "dependencies",
   "install",
@@ -31,7 +31,10 @@ const EXPECTED_PACKAGE_FILES = [
   "README.md",
   "commands/graphify-index.md",
   "dist/server.d.ts",
+  "dist/notifications.d.ts",
   "dist/server.js",
+  "dist/tui.js",
+  "dist/tui.d.ts",
   "docs/lifecycle.md",
   "package.json",
 ]
@@ -73,6 +76,10 @@ function shouldExposeBothServerEntrypointsWhenPackageIsPublished() {
       "./server": {
         types: "./dist/server.d.ts",
         import: "./dist/server.js",
+      },
+      "./tui": {
+        types: "./dist/tui.d.ts",
+        import: "./dist/tui.js",
       },
     },
     nodeEngine: NODE_RANGE,

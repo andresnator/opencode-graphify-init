@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-LOCAL_OPENCODE_BIN="$ROOT_DIR/node_modules/opencode-ai/bin/opencode.exe"
+LOCAL_OPENCODE_BIN="$ROOT_DIR/node_modules/@opencode/cli/bin/opencode.exe"
 if [[ -z "${OPENCODE_BIN:-}" && -x "$LOCAL_OPENCODE_BIN" ]]; then
   # pnpm generates a non-exec shell shim in node_modules/.bin. Launch the package's
   # native binary directly so SERVER_PID remains the process that owns all extract children.
@@ -21,12 +21,6 @@ INFO_DURATION_MS=5000
 HINT_DURATION_MS=8000
 RECOVERY_DURATION_MS=8000
 INSTALL_HINT="uv tool install graphifyy (or pipx install graphifyy)"
-# The plugin queues toasts until the first bus event or a fallback delay (real default 10s,
-# because pre-subscription bus events never reach the TUI). The suite's SSE listener attaches
-# right after boot, so a short fallback keeps every toast assertion fast; the two queue tests
-# override this to pin each flush trigger separately.
-TOAST_FLUSH_DELAY_MS_DEFAULT=200
-TOAST_DELAY_MS=$TOAST_FLUSH_DELAY_MS_DEFAULT
 # The extract time budget (real default 30 minutes, far past any honest run). Only the timeout
 # test shrinks it; the sentinel launches with the variable truly absent everywhere else.
 EXTRACT_TIMEOUT_MS="unset"
@@ -188,9 +182,9 @@ with open(events_file, encoding="utf-8") as events:
             event = json.loads(line.removeprefix("data: "))
         except json.JSONDecodeError:
             continue
-        payload = event.get("payload", {})
-        if payload.get("type") == "tui.toast.show":
-            toasts.append(payload.get("properties", {}))
+        payload = event
+        if payload.get("type") == "rpc.andresnator.graphify-init.notification":
+            toasts.append(payload.get("data", {}))
 
 matches = [toast for toast in toasts if toast.get("message") == expected_message]
 valid_matches = [
@@ -232,9 +226,9 @@ with open(events_file, encoding="utf-8") as events:
             event = json.loads(line.removeprefix("data: "))
         except json.JSONDecodeError:
             continue
-        payload = event.get("payload", {})
-        if payload.get("type") == "tui.toast.show":
-            toasts.append(payload.get("properties", {}))
+        payload = event
+        if payload.get("type") == "rpc.andresnator.graphify-init.notification":
+            toasts.append(payload.get("data", {}))
 
 matches = [toast for toast in toasts if re.fullmatch(message_pattern, toast.get("message", ""))]
 valid_matches = [
@@ -260,7 +254,7 @@ wait_for_url() {
   local attempts=$((TEST_TIMEOUT_SECONDS * 10))
   local attempt
   for ((attempt = 0; attempt < attempts; attempt++)); do
-    curl -fsS --max-time 1 "$url" >/dev/null 2>&1 && return 0
+    curl --user opencode:graphify-test-password -fsS --max-time 1 "$url" >/dev/null 2>&1 && return 0
     sleep "$POLL_INTERVAL_SECONDS"
   done
   fail "timed out waiting for $url"
@@ -333,20 +327,20 @@ start_server() {
     XDG_CONFIG_HOME="$XDG_DIR" \
     XDG_DATA_HOME="$XDG_DATA_DIR" \
     PATH="$path_value" \
+    OPENCODE_SERVER_PASSWORD=graphify-test-password \
     FAKE_GRAPHIFY_LOG="$FAKE_LOG" \
     FAKE_GRAPHIFY_NODE_COUNT="$FAKE_NODE_COUNT" \
-    OPENCODE_GRAPHIFY_TOAST_DELAY_MS="$TOAST_DELAY_MS" \
     "${autoinit_prefix[@]}" \
     "${global_prefix[@]}" \
     "${docs_prefix[@]}" \
     "${backend_prefix[@]}" \
     "${extract_timeout_prefix[@]}" \
-    "$OPENCODE_BIN" serve --hostname 127.0.0.1 --port "$PORT" --print-logs --log-level ERROR \
+    "$OPENCODE_BIN" serve --hostname 127.0.0.1 --port "$PORT" --print-logs --log-level error \
     >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
 
-  wait_for_url "http://127.0.0.1:$PORT/global/health"
-  curl -NsS --max-time 120 "http://127.0.0.1:$PORT/global/event" >"$EVENTS_FILE" 2>>"$SERVER_LOG" &
+  wait_for_url "http://127.0.0.1:$PORT/api/info"
+  curl --user opencode:graphify-test-password -NsS --max-time 120 "http://127.0.0.1:$PORT/api/event" >"$EVENTS_FILE" 2>>"$SERVER_LOG" &
   LISTENER_PID=$!
   sleep 0.2
 }
@@ -354,22 +348,18 @@ start_server() {
 request_config() {
   local root=$1
   local output=$2
-  curl -fsS --max-time "$TEST_TIMEOUT_SECONDS" --get --data-urlencode "directory=$root" \
-    "http://127.0.0.1:$PORT/config" >"$output"
-  jq -e . "$output" >/dev/null
-}
-
-# Publishes a client-driven bus event (tui.toast.show) for the root's instance — the cue the
-# plugin's event hook needs to flush queued toasts. A synthetic toast is the lightest such
-# event: unlike session creation it needs no provider or model resolution, which hangs in
-# this suite's hermetic HOME.
-publish_client_event() {
-  local root=$1
-  local encoded_root
-  encoded_root=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$root")
-  curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' \
-    -d '{"message":"suite client activity probe","variant":"info","duration":100}' \
-    "http://127.0.0.1:$PORT/tui/show-toast?directory=$encoded_root" >/dev/null
+  local attempt
+  # Location startup activates v2 plugins asynchronously; wait for the command registry.
+  for ((attempt = 0; attempt < TEST_TIMEOUT_SECONDS * 10; attempt++)); do
+    curl --user opencode:graphify-test-password -fsS --max-time "$TEST_TIMEOUT_SECONDS" --get \
+      --data-urlencode "location[directory]=$root" \
+      "http://127.0.0.1:$PORT/api/command" >"$output" || fail "command request failed"
+    if jq -e 'any(.data[]; .name == "graphify-index")' "$output" >/dev/null; then return; fi
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+  curl --user opencode:graphify-test-password -fsS --get --data-urlencode "location[directory]=$root" \
+    "http://127.0.0.1:$PORT/api/plugin" >&2 || true
+  fail "OpenCode did not activate the Graphify command"
 }
 
 git_init() {
@@ -731,10 +721,10 @@ PY
 }
 
 mkdir -p "$TARGET_DIR"
-jq -n --arg plugin "file://$ROOT_DIR/src/server.ts" '{plugin: [$plugin]}' > "$TARGET_DIR/opencode.json"
+jq -n --arg plugin "$ROOT_DIR/dist" '{plugins: [$plugin]}' > "$TARGET_DIR/opencode.json"
 
 shouldExposeBundledIndexCommandThroughOpenCodeConfig() {
-  # Given an isolated OpenCode server loading the source plugin.
+  # Given an isolated OpenCode v2 server loading the built plugin.
   local root
   local response="$SUITE_DIR/bundled-command.config.json"
   root=$(make_committed_repo bundled-command-repo)
@@ -743,11 +733,9 @@ shouldExposeBundledIndexCommandThroughOpenCodeConfig() {
   # When
   request_config "$root" "$response"
 
-  # Then the host invoked the plugin config hook and exposed the packaged command contract.
+  # Then the host invoked the plugin command transform and exposed the packaged command contract.
   jq -e '
-    .command["graphify-index"].agent == "build" and
-    (.command["graphify-index"].description | test("explicit human consent"; "i")) and
-    (.command["graphify-index"].template | contains("Never run `graphify update`"))
+    any(.data[]; .name == "graphify-index" and (.description | test("explicit human consent"; "i")))
   ' "$response" >/dev/null || fail "OpenCode config did not expose the bundled /graphify-index command"
   cleanup_processes
 }
@@ -816,7 +804,7 @@ shouldStaySilentWhenGraphMatchesHeadCommit() {
 
   # Then: planning is local, so an up-to-date repository never even probes the binary.
   [[ $(log_size) -eq "$size_before" ]] || fail "fresh graph still invoked Graphify"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "fresh graph emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "fresh graph emitted a toast"
   cleanup_processes
 }
 
@@ -843,41 +831,26 @@ shouldHintOncePerSessionInsteadOfFirstIndexing() {
   cleanup_processes
 }
 
-shouldQueueToastsUntilFirstBusEvent() {
-  # Given a fallback delay far beyond the test window: only client activity can flush.
+shouldReplayNotificationsWhenClientAttachesAfterInitialization() {
+  # Given a location that emits its hint before a TUI is attached.
   local root
-  root=$(make_committed_repo queue-until-event-repo)
-  TOAST_DELAY_MS=60000
-  start_server queue-until-event 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
-  TOAST_DELAY_MS=$TOAST_FLUSH_DELAY_MS_DEFAULT
+  root=$(make_committed_repo late-client-repo)
+  start_server late-client 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$root" "$SUITE_DIR/late-client.commands.json"
+  wait_for_pattern "No Graphify graph exists for late-client-repo yet." "$EVENTS_FILE"
 
-  # When: the plugin scans and queues its hint, but no client has interacted yet.
-  request_config "$root" "$SUITE_DIR/queue-until-event.config.json"
-  sleep 1
+  # When a late client requests the backlog through the public plugin RPC.
+  local encoded_root
+  encoded_root=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$root")
+  curl --user opencode:graphify-test-password -fsS --max-time 5 --request POST \
+    -H 'Content-Type: application/json' --data '{"input":{}}' \
+    "http://127.0.0.1:$PORT/api/rpc/andresnator.graphify-init/notifications?location%5Bdirectory%5D=$encoded_root" \
+    >"$SUITE_DIR/late-client.backlog.json"
 
-  # Then: nothing surfaces until the first bus event, which releases the queued hint.
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "toast surfaced before any client activity"
-  publish_client_event "$root"
-  wait_for_pattern "No Graphify graph exists for queue-until-event-repo yet." "$EVENTS_FILE"
-  cleanup_processes
-}
-
-shouldFlushQueuedToastsAfterFallbackDelay() {
-  # Given a fallback delay long enough to observe the queue, short enough to wait out.
-  local root
-  root=$(make_committed_repo queue-fallback-repo)
-  TOAST_DELAY_MS=3000
-  start_server queue-fallback 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
-  TOAST_DELAY_MS=$TOAST_FLUSH_DELAY_MS_DEFAULT
-
-  # When: no client ever interacts with the session.
-  request_config "$root" "$SUITE_DIR/queue-fallback.config.json"
-  sleep 1
-
-  # Then: the hint stays queued during the delay and surfaces on its own after it — the
-  # user who opens a TUI and just looks at the home screen still gets the hint.
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "toast surfaced before the fallback delay"
-  wait_for_pattern "No Graphify graph exists for queue-fallback-repo yet." "$EVENTS_FILE"
+  # Then the consent hint remains available without starting indexing.
+  jq -e '.output | length == 1 and (.[0].message | contains("late-client-repo"))' \
+    "$SUITE_DIR/late-client.backlog.json" >/dev/null || fail "late client lost its notification backlog"
+  [[ $(count_extract_calls "$root") -eq 0 ]] || fail "late client started first indexing"
   cleanup_processes
 }
 
@@ -1051,7 +1024,7 @@ shouldKeepExistingGraphWhenRepositoryHasNoCommits() {
 
   # Then: no commit signal means no evidence of staleness, so the graph is left alone.
   [[ $(log_size) -eq "$size_before" ]] || fail "repository without commits triggered a rebuild"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "repository without commits emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "repository without commits emitted a toast"
   cleanup_processes
 }
 
@@ -1127,7 +1100,7 @@ shouldReportEmptyWhenRepositoryLosesAllCode() {
   request_config "$root" "$SUITE_DIR/shrink-empty-reopen.config.json"
   sleep 1
   [[ $(count_extract_calls "$root") -eq 1 ]] || fail "shrunk repository was retried on reopen"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "reopened shrunk repository emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "reopened shrunk repository emitted a toast"
   cleanup_processes
 }
 
@@ -1157,7 +1130,7 @@ shouldReportEmptyWhenBuildProducesZeroNodeGraph() {
   request_config "$root" "$SUITE_DIR/zero-node-reopen.config.json"
   sleep 1
   [[ $(count_extract_calls "$root") -eq 1 ]] || fail "0-node repository was rebuilt on reopen"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "reopened 0-node repository emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "reopened 0-node repository emitted a toast"
   cleanup_processes
 }
 
@@ -1206,7 +1179,7 @@ shouldNotRetryARepositoryWithNothingToIndex() {
   request_config "$root" "$SUITE_DIR/docs-only-reopen.config.json"
   sleep 1
   [[ $(count_extract_calls "$root") -eq "$calls_after_first" ]] || fail "empty repository was retried on reopen"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "reopened empty repository emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "reopened empty repository emitted a toast"
 
   # And a new commit earns a fresh attempt.
   : >"$root/added"
@@ -1246,7 +1219,7 @@ shouldRecordSentinelMarkerForEmptyRootWithoutHead() {
   request_config "$root" "$SUITE_DIR/plain-nocode-reopen.config.json"
   sleep 1
   [[ $(count_extract_calls "$root") -eq 1 ]] || fail "HEAD-less empty root was retried on reopen"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "reopened HEAD-less empty root emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "reopened HEAD-less empty root emitted a toast"
   cleanup_processes
 }
 
@@ -1478,7 +1451,7 @@ shouldDoNothingWhenOptedOut() {
 
   # Then
   [[ $(log_size) -eq "$size_before" ]] || fail "opt-out called Graphify"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "opt-out emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "opt-out emitted a toast"
   cleanup_processes
 }
 
@@ -1678,7 +1651,7 @@ shouldSkipExtractWhileAnotherLiveSessionHoldsTheLock() {
   # Then: no concurrent extract, no toasts (the lock-holding session owns them), and the
   # live lock is left untouched.
   [[ $(count_extract_calls "$root") -eq 0 ]] || fail "live lock did not prevent a concurrent extract"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "locked repository emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "locked repository emitted a toast"
   grep -Fxq "$$" "$root/.ai/graphify-out/.opencode-extract-lock" || fail "live lock was clobbered"
   cleanup_processes
 }
@@ -1731,7 +1704,7 @@ shouldKeepLockWhileOrphanedExtractChildIsAlive() {
 
   # Then: the live child keeps the lock authoritative — no extract, no toast, lock intact.
   [[ $(count_extract_calls "$root") -eq 0 ]] || fail "live orphan child did not prevent a concurrent extract"
-  ! grep -Fq '"type":"tui.toast.show"' "$EVENTS_FILE" || fail "orphan-locked repository emitted a toast"
+  ! grep -Fq '"type":"rpc.andresnator.graphify-init.notification"' "$EVENTS_FILE" || fail "orphan-locked repository emitted a toast"
   grep -Fq "$child_pid" "$root/.ai/graphify-out/.opencode-extract-lock" || fail "orphan lock was clobbered"
   terminate_pid "$child_pid"
   cleanup_processes
@@ -1755,6 +1728,35 @@ shouldKillRunningExtractWhenServerIsTerminated() {
 
   # Then the plugin's shutdown hooks kill the spawned extract instead of orphaning it.
   wait_for_pid_exit "$builder_pid"
+  cleanup_processes
+}
+
+shouldStopOnlyItsOwnExtractWhenOneLocationUnloads() {
+  # Given two locations extracting concurrently in the same OpenCode server.
+  local first second first_pid second_pid
+  first=$(make_committed_repo unload-first-repo)
+  second=$(make_committed_repo unload-second-repo)
+  plant_mode "$first" code-only
+  plant_mode "$second" code-only
+  hold_builds "$first"
+  hold_builds "$second"
+  start_server unload 1 "$FAKE_BIN_DIR:/usr/bin:/bin"
+  request_config "$first" "$SUITE_DIR/unload-first.commands.json"
+  request_config "$second" "$SUITE_DIR/unload-second.commands.json"
+  wait_for_file "$first/.fake-graphify/build.pid"
+  wait_for_file "$second/.fake-graphify/build.pid"
+  first_pid=$(<"$first/.fake-graphify/build.pid")
+  second_pid=$(<"$second/.fake-graphify/build.pid")
+
+  # When project configuration unloads only the first location's plugin.
+  printf '%s\n' '{"plugins":["-andresnator.graphify-init"]}' >"$first/opencode.json"
+  wait_for_pid_exit "$first_pid"
+
+  # Then cancellation retains the uncertain lock, and the other location keeps running.
+  [[ -f "$first/.ai/graphify-out/.opencode-extract-lock" ]] || fail "unload erased interrupted extraction lock"
+  kill -0 "$second_pid" 2>/dev/null || fail "unloading one location killed another location's extract"
+  release_builds "$second"
+  wait_for_pattern "Graphify graph for unload-second-repo is ready" "$EVENTS_FILE"
   cleanup_processes
 }
 
@@ -2287,6 +2289,7 @@ console.log('PASS: two process-level stale claimants cannot replace an interveni
 JS
 }
 
+if [[ "${GRAPHIFY_TEST_FOCUS:-}" == unload ]]; then shouldStopOnlyItsOwnExtractWhenOneLocationUnloads; exit 0; fi
 if [[ "${GRAPHIFY_TEST_FOCUS:-}" == bookkeeping ]]; then shouldReportBookkeepingFailureAfterSuccessfulGlobalReconciliation; exit 0; fi
 if [[ "${GRAPHIFY_TEST_FOCUS:-}" == aggregate-mixed ]]; then shouldSummarizeReconciledSubsetWhenAnotherRepositoryIsLocked; exit 0; fi
 if [[ "${GRAPHIFY_TEST_FOCUS:-}" == aggregate-reconcile ]]; then shouldSummarizeCompletedAggregateReconciliation; exit 0; fi
@@ -2312,8 +2315,7 @@ shouldExposeBundledIndexCommandThroughOpenCodeConfig
 shouldKeepConfigResponsiveWhileBuildingInBackground
 shouldStaySilentWhenGraphMatchesHeadCommit
 shouldHintOncePerSessionInsteadOfFirstIndexing
-shouldQueueToastsUntilFirstBusEvent
-shouldFlushQueuedToastsAfterFallbackDelay
+shouldReplayNotificationsWhenClientAttachesAfterInitialization
 shouldAggregateHintWhenNestedRepositoriesHaveNoConsent
 shouldRefreshStaleGraphWithIncrementalExtract
 shouldReExtractWhenCommitLandsMidExtract
@@ -2348,6 +2350,7 @@ shouldSkipExtractWhileAnotherLiveSessionHoldsTheLock
 shouldRetainStaleLockLeftByDeadSession
 shouldKeepLockWhileOrphanedExtractChildIsAlive
 shouldKillRunningExtractWhenServerIsTerminated
+shouldStopOnlyItsOwnExtractWhenOneLocationUnloads
 shouldKillExtractThatExceedsItsTimeBudget
 shouldWarnWhenBinaryIsMissing
 shouldWarnWhenGlobalMergeFailsDespiteExitZero
