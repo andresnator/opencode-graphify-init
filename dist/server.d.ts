@@ -1,9 +1,8 @@
-import type { Config, Plugin } from "@opencode-ai/plugin";
-export declare const GRAPHIFY_INIT_PLUGIN_ID = "andresnator.graphify-init";
-export declare function registerGraphifyIndexCommand(config: Config): Promise<void>;
-export declare const GraphifyInitPlugin: Plugin;
-declare const _default: {
+import type { Plugin } from "@opencode/plugin";
+export { GRAPHIFY_INIT_PLUGIN_ID } from "./notifications.js";
+export declare function registerGraphifyIndexCommand(ctx: Pick<Plugin.Context, "command" | "session">): Promise<void>;
+export declare const GraphifyInitPlugin: {
     id: string;
-    server: Plugin;
+    setup(ctx: Plugin.Context): Promise<() => Promise<void>>;
 };
-export default _default;
+export default GraphifyInitPlugin;

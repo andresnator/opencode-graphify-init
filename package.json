@@ -15,6 +15,10 @@
     "./server": {
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
     }
   },
   "files": [
@@ -28,7 +32,7 @@
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "bash scripts/test-graphify-init.sh && node tests/command-registration.test.mjs && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs && node tests/package-publication.test.mjs && node tests/ci-workflow.test.mjs && node tests/publish-workflow.test.mjs && pnpm run test:install",
+    "test": "bash scripts/test-graphify-init.sh && node tests/command-registration.test.mjs && node tests/notifications.test.mjs && node tests/validate-pr-title.test.mjs && node tests/release-policy.test.mjs && node tests/package-publication.test.mjs && node tests/ci-workflow.test.mjs && node tests/publish-workflow.test.mjs && pnpm run test:install",
     "test:install": "node tests/clean-cache-install.test.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:workflows": "node scripts/verify-workflow-actions.mjs",
@@ -39,14 +43,14 @@
   },
   "engines": {
     "node": ">=22.0.0",
-    "opencode": ">=1.17.15 <2"
+    "opencode": ">=2.0.28 <3"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.13",
     "@types/node": "26.2.0",
     "esbuild": "0.28.1",
-    "opencode-ai": "1.18.13",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "@opencode/plugin": "2.0.28",
+    "@opencode/cli": "2.0.28"
   },
   "publishConfig": {
     "access": "public",

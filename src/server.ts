@@ -1,9 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process"
+import { randomUUID } from "node:crypto"
+import { AsyncLocalStorage } from "node:async_hooks"
 import fs, { type FileHandle } from "node:fs/promises"
 import path from "node:path"
-import type { Config, Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
+import { GRAPHIFY_INIT_PLUGIN_ID, notificationsRpc, type Notification } from "./notifications.js"
 
-export const GRAPHIFY_INIT_PLUGIN_ID = "andresnator.graphify-init"
+export { GRAPHIFY_INIT_PLUGIN_ID } from "./notifications.js"
 const LOG_PREFIX = "[graphify-init]"
 const GRAPHIFY_BINARY = "graphify"
 const GRAPHIFY_INSTALL_HINT = "uv tool install graphifyy (or pipx install graphifyy)"
@@ -71,16 +74,6 @@ const INFO_DURATION_MS = 5_000
 const HINT_DURATION_MS = 8_000
 const WARNING_DURATION_MS = 8_000
 const ERROR_DURATION_MS = 8_000
-// Toasts ride the event bus (`tui.toast.show`), and bus events published before a subscriber
-// attaches are dropped. The TUI subscribes to /event a second or two AFTER the instance
-// bootstraps — after this plugin has already scanned and toasted — and `server.connected` is
-// written straight to the new subscriber's SSE stream, never through the bus, so a plugin
-// cannot observe the TUI attaching. Toasts therefore queue until the first bus event this
-// plugin receives (a client is interacting, so it is subscribed) or until a fallback delay
-// comfortably past any real TUI subscription, whichever comes first. The env override exists
-// solely so the test suite can shrink or stretch the delay; it never changes behavior shape.
-const TOAST_READY_FALLBACK_MS = 10_000
-const TOAST_DELAY_ENV = "OPENCODE_GRAPHIFY_TOAST_DELAY_MS"
 // No spawn may hang forever. The extract holds the per-repo lock for its whole run, and the
 // lock is only released when the call resolves — so a wedged child (a docs-mode backend call
 // that never answers, a git probe on an unreachable network mount) blocks every later session
@@ -113,24 +106,8 @@ type CommandResult = {
   error?: Error
 }
 
-type ToastClient = {
-  tui: {
-    showToast(options: {
-      body: {
-        message: string
-        variant: ToastVariant
-        duration: number
-      }
-      query: {
-        directory: string
-      }
-    }): Promise<unknown>
-  }
-}
-
 type ToastInput = {
-  client: ToastClient
-  directory: string
+  notify(message: string, variant: ToastVariant, duration: number): Promise<void>
 }
 
 type RepoAction = "build" | "update"
@@ -242,17 +219,24 @@ function loadIndexCommandTemplate() {
   return indexCommandTemplate
 }
 
-export async function registerGraphifyIndexCommand(config: Config) {
-  config.command ??= {}
-  if (config.command[INDEX_COMMAND_NAME]) {
-    return
-  }
-
-  config.command[INDEX_COMMAND_NAME] = {
-    template: await loadIndexCommandTemplate(),
-    description: INDEX_COMMAND_DESCRIPTION,
-    agent: "build",
-  }
+export async function registerGraphifyIndexCommand(ctx: Pick<Plugin.Context, "command" | "session">) {
+  if ((await ctx.command.list()).data.some((command) => command.name === INDEX_COMMAND_NAME)) return
+  const template = await loadIndexCommandTemplate()
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: INDEX_COMMAND_NAME,
+      description: INDEX_COMMAND_DESCRIPTION,
+      async execute(input) {
+        await ctx.session.switchAgent({ sessionID: input.sessionID, agent: "build" })
+        await ctx.session.prompt({
+          ...input.prompt,
+          sessionID: input.sessionID,
+          text: template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+          delivery: input.delivery,
+        })
+      },
+    })
+  })
 }
 
 // Keep the TAIL of each stream: Graphify's decisive lines — the empty-corpus signal and
@@ -265,33 +249,44 @@ function appendBoundedOutput(current: string, chunk: unknown) {
 // child is re-parented to PID 1 and keeps burning CPU (and, in docs mode, LLM tokens)
 // after the session is gone. Shutdown hooks request termination; they cannot prove
 // that a process tree stopped. A SIGKILLed parent leaves the lock for manual recovery.
-const liveChildren = new Set<ChildProcess>()
+type Runtime = { closed: boolean; children: Set<ChildProcess> }
+const runtimes = new Set<Runtime>()
+const activeRuntime = new AsyncLocalStorage<Runtime>()
 let shutdownHooksInstalled = false
 const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 } as const
+const signalHandlers = Object.entries(SIGNAL_EXIT_CODES).map(([signal, exitCode]) => ({
+  signal: signal as NodeJS.Signals,
+  handler: () => {
+    killLiveChildren()
+    if (process.listenerCount(signal) === 0) process.exit(exitCode)
+  },
+}))
 
-function killLiveChildren() {
-  for (const child of liveChildren) {
-    try {
-      child.kill("SIGTERM")
-    } catch (error) {
+function stopRuntime(runtime: Runtime) {
+  runtime.closed = true
+  for (const child of runtime.children) {
+    try { child.kill("SIGTERM") } catch (error) {
       console.error(`${LOG_PREFIX} cannot kill child process: ${errorMessage(error)}`)
     }
   }
-  liveChildren.clear()
+}
+
+function killLiveChildren() {
+  for (const runtime of runtimes) stopRuntime(runtime)
 }
 
 function installShutdownHooks() {
   if (shutdownHooksInstalled) return
   shutdownHooksInstalled = true
   process.once("exit", killLiveChildren)
-  for (const [signal, exitCode] of Object.entries(SIGNAL_EXIT_CODES)) {
-    process.once(signal as NodeJS.Signals, () => {
-      killLiveChildren()
-      // Mimic the signal's default disposition only when nothing else handles it; when the
-      // host has its own graceful-shutdown handler, that handler decides when the process ends.
-      if (process.listenerCount(signal) === 0) process.exit(exitCode)
-    })
-  }
+  for (const { signal, handler } of signalHandlers) process.once(signal, handler)
+}
+
+function removeShutdownHooksIfIdle() {
+  if (runtimes.size > 0 || !shutdownHooksInstalled) return
+  process.removeListener("exit", killLiveChildren)
+  for (const { signal, handler } of signalHandlers) process.removeListener(signal, handler)
+  shutdownHooksInstalled = false
 }
 
 function extractTimeoutMs() {
@@ -316,6 +311,11 @@ function runCommand(
   options: RunOptions = {},
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
+    const runtime = activeRuntime.getStore()
+    if (!runtime || runtime.closed) {
+      resolve({ exitCode: null, stdout: "", stderr: "", error: new Error("Graphify plugin unloaded") })
+      return
+    }
     installShutdownHooks()
     const child = spawn(binary, [...args], {
       cwd: root,
@@ -323,7 +323,7 @@ function runCommand(
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     })
-    liveChildren.add(child)
+    runtime.children.add(child)
     options.onSpawn?.(child)
     let stdout = ""
     let stderr = ""
@@ -361,8 +361,8 @@ function runCommand(
     child.once("close", (exitCode) => {
       clearTimeout(budgetTimer)
       if (killTimer) clearTimeout(killTimer)
-      liveChildren.delete(child)
-      resolve({ exitCode, stdout, stderr, error: spawnError })
+      runtime.children.delete(child)
+      resolve({ exitCode, stdout, stderr, error: spawnError ?? (runtime.closed ? new Error("Graphify plugin unloaded") : undefined) })
     })
   })
 }
@@ -725,80 +725,12 @@ function isGlobalEnabled() {
   return process.env[GLOBAL_ENV] !== GLOBAL_OPT_OUT
 }
 
-type PendingToast = {
-  input: ToastInput
-  message: string
-  variant: ToastVariant
-  duration: number
-}
-
-let toastClientReady = false
-let toastFallbackTimer: ReturnType<typeof setTimeout> | undefined
-const pendingToasts: PendingToast[] = []
-
-function toastFallbackDelayMs() {
-  const raw = process.env[TOAST_DELAY_ENV]
-  if (raw !== undefined) {
-    const parsed = Number(raw)
-    if (Number.isFinite(parsed) && parsed >= 0) return parsed
-  }
-  return TOAST_READY_FALLBACK_MS
-}
-
-async function sendToast(input: ToastInput, message: string, variant: ToastVariant, duration: number) {
+async function showToastBestEffort(input: ToastInput, message: string, variant: ToastVariant, duration: number) {
   try {
-    await input.client.tui.showToast({
-      body: { message, variant, duration },
-      query: { directory: input.directory },
-    })
+    await input.notify(message, variant, duration)
   } catch (error) {
-    console.error(`${LOG_PREFIX} toast failed: ${errorMessage(error)}`)
+    console.error(`${LOG_PREFIX} notification failed: ${errorMessage(error)}`)
   }
-}
-
-// Only events a connected client causes prove the TUI is subscribed. Server housekeeping
-// (file watcher, VCS branch detection, LSP) also rides the bus during boot, before any
-// subscriber exists — flushing on those would lose the queue all over again.
-const CLIENT_EVENT_PREFIXES = ["session.", "message.", "permission.", "tui.", "command."] as const
-
-function isClientDrivenEvent(type: string) {
-  return CLIENT_EVENT_PREFIXES.some((prefix) => type.startsWith(prefix))
-}
-
-async function releaseQueuedToasts() {
-  if (toastClientReady) return
-  toastClientReady = true
-  if (toastFallbackTimer !== undefined) {
-    clearTimeout(toastFallbackTimer)
-    toastFallbackTimer = undefined
-  }
-  for (const toast of pendingToasts.splice(0)) {
-    await sendToast(toast.input, toast.message, toast.variant, toast.duration)
-  }
-}
-
-// unref keeps the timer from holding the server process open at shutdown; pending toasts
-// simply die with the process, which is the right outcome for a session nobody ever saw.
-function armToastFallback() {
-  if (toastClientReady || toastFallbackTimer !== undefined) return
-  toastFallbackTimer = setTimeout(() => {
-    toastFallbackTimer = undefined
-    void releaseQueuedToasts()
-  }, toastFallbackDelayMs())
-  toastFallbackTimer.unref?.()
-}
-
-async function showToastBestEffort(
-  input: ToastInput,
-  message: string,
-  variant: ToastVariant,
-  duration: number,
-) {
-  if (!toastClientReady) {
-    pendingToasts.push({ input, message, variant, duration })
-    return
-  }
-  await sendToast(input, message, variant, duration)
 }
 
 async function resolveGitExcludePath(root: string) {
@@ -875,8 +807,10 @@ async function buildRepoGraph(
   if (!lock) return { kind: "locked" }
   let safeToRelease = true
   try {
+    if (activeRuntime.getStore()?.closed) return { kind: "locked" }
     // Replan under exclusive ownership: another session may have completed the migration.
     const current = await planRepo(root)
+    if (activeRuntime.getStore()?.closed) return { kind: "locked" }
     if (current.kind === "none" || current.kind === "needs-consent") return { kind: "locked" }
     const tag = slugify(repoName(await realRoot(root)))
     const state = await readIndexState(root)
@@ -1122,6 +1056,7 @@ async function collectWork(roots: string[]) {
   const work: WorkItem[] = []
   const needsConsent: string[] = []
   for (const root of roots) {
+    if (activeRuntime.getStore()?.closed) break
     const plan = await planRepo(root)
     if (plan.kind === "needs-consent") needsConsent.push(root)
     else if (plan.kind !== "none") work.push({ root, action: plan.kind === "reconcile" ? "update" : plan.kind })
@@ -1159,23 +1094,43 @@ async function initializeGraphify(input: ToastInput & { root: string }) {
   return presentAggregate(input, root, work)
 }
 
-export const GraphifyInitPlugin: Plugin = async (input) => {
-  const root = projectRoot(input)
-  armToastFallback()
-  void initializeGraphify({ client: input.client, directory: input.directory, root }).catch((error) => {
-    console.error(`${LOG_PREFIX} ${errorMessage(error)}`)
-  })
-  return {
-    config: registerGraphifyIndexCommand,
-    // A client-driven bus event means a subscribed client is interacting, so queued
-    // toasts can land; boot-time housekeeping events must not trip the latch.
-    event: async ({ event }) => {
-      if (isClientDrivenEvent(event?.type ?? "")) await releaseQueuedToasts()
-    },
-  }
-}
-
-export default {
+export const GraphifyInitPlugin = {
   id: GRAPHIFY_INIT_PLUGIN_ID,
-  server: GraphifyInitPlugin,
-}
+  async setup(ctx) {
+    await registerGraphifyIndexCommand(ctx)
+    const runtime: Runtime = { closed: false, children: new Set() }
+    const history: Notification[] = []
+    const rpc = await ctx.rpc.register(notificationsRpc, {
+      notifications: async () => history.slice(),
+    })
+    runtimes.add(runtime)
+    const root = projectRoot({ directory: ctx.location.directory, worktree: ctx.location.project.directory })
+    const work = activeRuntime.run(runtime, () => initializeGraphify({
+      root,
+      async notify(message, variant, duration) {
+        if (runtime.closed) return
+        const notification = { id: randomUUID(), message, variant, duration }
+        history.push(notification)
+        // Bound memory for large aggregate workspaces. Current runs produce only summaries.
+        if (history.length > 100) history.shift()
+        await rpc.events.emit("notification", notification)
+      },
+    })).catch((error) => console.error(`${LOG_PREFIX} ${errorMessage(error)}`))
+    return async () => {
+      stopRuntime(runtime)
+      const timer = setTimeout(() => {
+        for (const child of runtime.children) child.kill("SIGKILL")
+      }, KILL_GRACE_MS)
+      timer.unref?.()
+      try { await work } finally {
+        clearTimeout(timer)
+        runtimes.delete(runtime)
+        removeShutdownHooksIfIdle()
+        history.length = 0
+        await rpc.dispose()
+      }
+    }
+  },
+} satisfies Plugin.Plugin
+
+export default GraphifyInitPlugin

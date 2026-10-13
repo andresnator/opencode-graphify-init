@@ -12,7 +12,7 @@ assert.equal(packageJson.dependencies, undefined, "published package must not ha
 assert.equal(packageJson.exports?.["."]?.import, "./dist/server.js")
 assert.equal(packageJson.exports?.["./server"]?.import, "./dist/server.js")
 assert.equal(packageJson.engines?.node, ">=22.0.0")
-assert.equal(packageJson.engines?.opencode, ">=1.17.15 <2")
+assert.equal(packageJson.engines?.opencode, ">=2.0.28 <3")
 assert.ok(!bundle.includes("agents-orchestrator"), "bundle still contains source-harness coupling")
 
 const bareImports = [...bundle.matchAll(/\b(?:from\s+|import\s*\()(["'])([^"']+)\1/g)].map((match) => match[2])
@@ -26,8 +26,10 @@ const rootPlugin = await import(packageJson.name)
 const serverPlugin = await import(`${packageJson.name}/server`)
 assert.equal(rootPlugin.default, serverPlugin.default, "root and /server must resolve to the same plugin")
 assert.equal(rootPlugin.default?.id, "andresnator.graphify-init")
-assert.equal(typeof rootPlugin.default?.server, "function")
-assert.equal("tui" in rootPlugin.default, false, "server entry must not also export a TUI plugin")
+assert.equal(typeof rootPlugin.default?.setup, "function")
+const tuiPlugin = await import(`${packageJson.name}/tui`)
+assert.equal(tuiPlugin.default?.id, rootPlugin.default.id)
+assert.equal(typeof tuiPlugin.default?.setup, "function")
 
 const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
   cwd: root,

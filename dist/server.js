@@ -1,8 +1,35 @@
 // src/server.ts
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
+
+// src/notifications.ts
 var GRAPHIFY_INIT_PLUGIN_ID = "andresnator.graphify-init";
+var notificationSchema = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    message: { type: "string" },
+    variant: { type: "string", enum: ["info", "success", "warning", "error"] },
+    duration: { type: "integer" }
+  },
+  required: ["id", "message", "variant", "duration"],
+  additionalProperties: false
+};
+var notificationsRpc = {
+  id: GRAPHIFY_INIT_PLUGIN_ID,
+  methods: {
+    notifications: {
+      input: { type: "object", additionalProperties: false },
+      output: { type: "array", items: notificationSchema }
+    }
+  },
+  events: { notification: { schema: notificationSchema } }
+};
+
+// src/server.ts
 var LOG_PREFIX = "[graphify-init]";
 var GRAPHIFY_BINARY = "graphify";
 var GRAPHIFY_INSTALL_HINT = "uv tool install graphifyy (or pipx install graphifyy)";
@@ -49,8 +76,6 @@ var INFO_DURATION_MS = 5e3;
 var HINT_DURATION_MS = 8e3;
 var WARNING_DURATION_MS = 8e3;
 var ERROR_DURATION_MS = 8e3;
-var TOAST_READY_FALLBACK_MS = 1e4;
-var TOAST_DELAY_ENV = "OPENCODE_GRAPHIFY_TOAST_DELAY_MS";
 var PROBE_TIMEOUT_MS = 15e3;
 var EXTRACT_TIMEOUT_MS = 30 * 60 * 1e3;
 var EXTRACT_TIMEOUT_ENV = "OPENCODE_GRAPHIFY_EXTRACT_TIMEOUT_MS";
@@ -114,43 +139,63 @@ function loadIndexCommandTemplate() {
   indexCommandTemplate ??= fs.readFile(INDEX_COMMAND_FILE, "utf8").then((template) => template.trim());
   return indexCommandTemplate;
 }
-async function registerGraphifyIndexCommand(config) {
-  config.command ??= {};
-  if (config.command[INDEX_COMMAND_NAME]) {
-    return;
-  }
-  config.command[INDEX_COMMAND_NAME] = {
-    template: await loadIndexCommandTemplate(),
-    description: INDEX_COMMAND_DESCRIPTION,
-    agent: "build"
-  };
+async function registerGraphifyIndexCommand(ctx) {
+  if ((await ctx.command.list()).data.some((command) => command.name === INDEX_COMMAND_NAME)) return;
+  const template = await loadIndexCommandTemplate();
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: INDEX_COMMAND_NAME,
+      description: INDEX_COMMAND_DESCRIPTION,
+      async execute(input) {
+        await ctx.session.switchAgent({ sessionID: input.sessionID, agent: "build" });
+        await ctx.session.prompt({
+          ...input.prompt,
+          sessionID: input.sessionID,
+          text: template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+          delivery: input.delivery
+        });
+      }
+    });
+  });
 }
 function appendBoundedOutput(current, chunk) {
   return `${current}${String(chunk)}`.slice(-MAX_CAPTURED_OUTPUT_LENGTH);
 }
-var liveChildren = /* @__PURE__ */ new Set();
+var runtimes = /* @__PURE__ */ new Set();
+var activeRuntime = new AsyncLocalStorage();
 var shutdownHooksInstalled = false;
 var SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
-function killLiveChildren() {
-  for (const child of liveChildren) {
+var signalHandlers = Object.entries(SIGNAL_EXIT_CODES).map(([signal, exitCode]) => ({
+  signal,
+  handler: () => {
+    killLiveChildren();
+    if (process.listenerCount(signal) === 0) process.exit(exitCode);
+  }
+}));
+function stopRuntime(runtime) {
+  runtime.closed = true;
+  for (const child of runtime.children) {
     try {
       child.kill("SIGTERM");
     } catch (error) {
       console.error(`${LOG_PREFIX} cannot kill child process: ${errorMessage(error)}`);
     }
   }
-  liveChildren.clear();
+}
+function killLiveChildren() {
+  for (const runtime of runtimes) stopRuntime(runtime);
 }
 function installShutdownHooks() {
   if (shutdownHooksInstalled) return;
   shutdownHooksInstalled = true;
   process.once("exit", killLiveChildren);
-  for (const [signal, exitCode] of Object.entries(SIGNAL_EXIT_CODES)) {
-    process.once(signal, () => {
-      killLiveChildren();
-      if (process.listenerCount(signal) === 0) process.exit(exitCode);
-    });
-  }
+  for (const { signal, handler } of signalHandlers) process.once(signal, handler);
+}
+function removeShutdownHooksIfIdle() {
+  if (runtimes.size > 0 || !shutdownHooksInstalled) return;
+  process.removeListener("exit", killLiveChildren);
+  for (const { signal, handler } of signalHandlers) process.removeListener(signal, handler);
+  shutdownHooksInstalled = false;
 }
 function extractTimeoutMs() {
   const raw = process.env[EXTRACT_TIMEOUT_ENV];
@@ -162,6 +207,11 @@ function extractTimeoutMs() {
 }
 function runCommand(binary, args, root, options = {}) {
   return new Promise((resolve) => {
+    const runtime = activeRuntime.getStore();
+    if (!runtime || runtime.closed) {
+      resolve({ exitCode: null, stdout: "", stderr: "", error: new Error("Graphify plugin unloaded") });
+      return;
+    }
     installShutdownHooks();
     const child = spawn(binary, [...args], {
       cwd: root,
@@ -169,7 +219,7 @@ function runCommand(binary, args, root, options = {}) {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
-    liveChildren.add(child);
+    runtime.children.add(child);
     options.onSpawn?.(child);
     let stdout = "";
     let stderr = "";
@@ -202,8 +252,8 @@ function runCommand(binary, args, root, options = {}) {
     child.once("close", (exitCode) => {
       clearTimeout(budgetTimer);
       if (killTimer) clearTimeout(killTimer);
-      liveChildren.delete(child);
-      resolve({ exitCode, stdout, stderr, error: spawnError });
+      runtime.children.delete(child);
+      resolve({ exitCode, stdout, stderr, error: spawnError ?? (runtime.closed ? new Error("Graphify plugin unloaded") : void 0) });
     });
   });
 }
@@ -525,56 +575,12 @@ function slugify(value) {
 function isGlobalEnabled() {
   return process.env[GLOBAL_ENV] !== GLOBAL_OPT_OUT;
 }
-var toastClientReady = false;
-var toastFallbackTimer;
-var pendingToasts = [];
-function toastFallbackDelayMs() {
-  const raw = process.env[TOAST_DELAY_ENV];
-  if (raw !== void 0) {
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
-  }
-  return TOAST_READY_FALLBACK_MS;
-}
-async function sendToast(input, message, variant, duration) {
-  try {
-    await input.client.tui.showToast({
-      body: { message, variant, duration },
-      query: { directory: input.directory }
-    });
-  } catch (error) {
-    console.error(`${LOG_PREFIX} toast failed: ${errorMessage(error)}`);
-  }
-}
-var CLIENT_EVENT_PREFIXES = ["session.", "message.", "permission.", "tui.", "command."];
-function isClientDrivenEvent(type) {
-  return CLIENT_EVENT_PREFIXES.some((prefix) => type.startsWith(prefix));
-}
-async function releaseQueuedToasts() {
-  if (toastClientReady) return;
-  toastClientReady = true;
-  if (toastFallbackTimer !== void 0) {
-    clearTimeout(toastFallbackTimer);
-    toastFallbackTimer = void 0;
-  }
-  for (const toast of pendingToasts.splice(0)) {
-    await sendToast(toast.input, toast.message, toast.variant, toast.duration);
-  }
-}
-function armToastFallback() {
-  if (toastClientReady || toastFallbackTimer !== void 0) return;
-  toastFallbackTimer = setTimeout(() => {
-    toastFallbackTimer = void 0;
-    void releaseQueuedToasts();
-  }, toastFallbackDelayMs());
-  toastFallbackTimer.unref?.();
-}
 async function showToastBestEffort(input, message, variant, duration) {
-  if (!toastClientReady) {
-    pendingToasts.push({ input, message, variant, duration });
-    return;
+  try {
+    await input.notify(message, variant, duration);
+  } catch (error) {
+    console.error(`${LOG_PREFIX} notification failed: ${errorMessage(error)}`);
   }
-  await sendToast(input, message, variant, duration);
 }
 async function resolveGitExcludePath(root) {
   const result = await runCommand(GIT_BINARY, GIT_EXCLUDE_ARGS, root);
@@ -629,7 +635,9 @@ async function buildRepoGraph(root, action, onStart) {
   if (!lock) return { kind: "locked" };
   let safeToRelease = true;
   try {
+    if (activeRuntime.getStore()?.closed) return { kind: "locked" };
     const current = await planRepo(root);
+    if (activeRuntime.getStore()?.closed) return { kind: "locked" };
     if (current.kind === "none" || current.kind === "needs-consent") return { kind: "locked" };
     const tag = slugify(repoName(await realRoot(root)));
     const state = await readIndexState(root);
@@ -843,6 +851,7 @@ async function collectWork(roots) {
   const work = [];
   const needsConsent = [];
   for (const root of roots) {
+    if (activeRuntime.getStore()?.closed) break;
     const plan = await planRepo(root);
     if (plan.kind === "needs-consent") needsConsent.push(root);
     else if (plan.kind !== "none") work.push({ root, action: plan.kind === "reconcile" ? "update" : plan.kind });
@@ -867,25 +876,46 @@ async function initializeGraphify(input) {
   if (aggregated.length === 0) return presentSingleRoot(input, work[0].root, work[0].action);
   return presentAggregate(input, root, work);
 }
-var GraphifyInitPlugin = async (input) => {
-  const root = projectRoot(input);
-  armToastFallback();
-  void initializeGraphify({ client: input.client, directory: input.directory, root }).catch((error) => {
-    console.error(`${LOG_PREFIX} ${errorMessage(error)}`);
-  });
-  return {
-    config: registerGraphifyIndexCommand,
-    // A client-driven bus event means a subscribed client is interacting, so queued
-    // toasts can land; boot-time housekeeping events must not trip the latch.
-    event: async ({ event }) => {
-      if (isClientDrivenEvent(event?.type ?? "")) await releaseQueuedToasts();
-    }
-  };
-};
-var server_default = {
+var GraphifyInitPlugin = {
   id: GRAPHIFY_INIT_PLUGIN_ID,
-  server: GraphifyInitPlugin
+  async setup(ctx) {
+    await registerGraphifyIndexCommand(ctx);
+    const runtime = { closed: false, children: /* @__PURE__ */ new Set() };
+    const history = [];
+    const rpc = await ctx.rpc.register(notificationsRpc, {
+      notifications: async () => history.slice()
+    });
+    runtimes.add(runtime);
+    const root = projectRoot({ directory: ctx.location.directory, worktree: ctx.location.project.directory });
+    const work = activeRuntime.run(runtime, () => initializeGraphify({
+      root,
+      async notify(message, variant, duration) {
+        if (runtime.closed) return;
+        const notification = { id: randomUUID(), message, variant, duration };
+        history.push(notification);
+        if (history.length > 100) history.shift();
+        await rpc.events.emit("notification", notification);
+      }
+    })).catch((error) => console.error(`${LOG_PREFIX} ${errorMessage(error)}`));
+    return async () => {
+      stopRuntime(runtime);
+      const timer = setTimeout(() => {
+        for (const child of runtime.children) child.kill("SIGKILL");
+      }, KILL_GRACE_MS);
+      timer.unref?.();
+      try {
+        await work;
+      } finally {
+        clearTimeout(timer);
+        runtimes.delete(runtime);
+        removeShutdownHooksIfIdle();
+        history.length = 0;
+        await rpc.dispose();
+      }
+    };
+  }
 };
+var server_default = GraphifyInitPlugin;
 export {
   GRAPHIFY_INIT_PLUGIN_ID,
   GraphifyInitPlugin,
